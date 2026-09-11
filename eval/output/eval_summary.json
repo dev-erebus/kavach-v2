@@ -63,5 +63,10 @@
     "auc_roc": 0.9880759668624692,
     "rules_on_same_split_auc_pr": 0.0017046649997373006
   },
+  "adversarial": {
+    "passed": 44,
+    "total": 44,
+    "false_positives": 0
+  },
   "domain_caveat": "card-present/e-commerce fraud dataset; validates pipeline mechanics only, NOT UPI/IMPS social-engineering detection"
 }

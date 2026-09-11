@@ -84,6 +84,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--path", type=Path, default=None, help="local CSV (ulb) or directory (ieee_cis)")
     ap.add_argument("--out", type=Path, default=Path("eval/output"))
     ap.add_argument("--no-baseline", action="store_true", help="skip the reference ML baseline")
+    ap.add_argument("--no-adversarial", action="store_true", help="skip the §5.2 adversarial suite")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fx", type=str, default=None, help="override FX-to-INR constant, e.g. 90")
     args = ap.parse_args(argv)
@@ -111,8 +112,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("[eval] fitting reference logistic-regression baseline ...", flush=True)
         baseline, rules_test = reference_baseline(ds, mapped, levels, args.seed)
 
+    adversarial_md = None
+    adv_summary = None
+    if not args.no_adversarial:
+        from . import adversarial
+
+        results = adversarial.run_all()
+        adversarial_md = adversarial.render_markdown(results)
+        adv_summary = {"passed": sum(r.passed for r in results), "total": len(results),
+                       "false_positives": sum((not r.passed) and r.case.expect == "must_pass" for r in results)}
+        print(f"[eval] adversarial suite: {adv_summary['passed']}/{adv_summary['total']} passed")
+
     path = report.render(
-        report.ReportInputs(ds, mapped, rule_cfg, full, rules_test, baseline),
+        report.ReportInputs(ds, mapped, rule_cfg, full, rules_test, baseline, adversarial=adversarial_md),
         args.out,
     )
 
@@ -135,6 +147,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "name": baseline.name, "auc_pr": baseline.metrics.auc_pr, "auc_roc": baseline.metrics.auc_roc,
             "rules_on_same_split_auc_pr": rules_test.auc_pr if rules_test else None,
         },
+        "adversarial": adv_summary,
         "domain_caveat": "card-present/e-commerce fraud dataset; validates pipeline mechanics only, NOT UPI/IMPS social-engineering detection",
     }
     (args.out / "eval_summary.json").write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
