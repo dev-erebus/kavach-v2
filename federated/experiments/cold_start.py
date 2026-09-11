@@ -266,8 +266,10 @@ class PoisonTrial:
     attackers: int
     attack: str
     rule: str
+    history: int  # rows of the held-out bank's own history fine-tuned on top of the (possibly poisoned) global model
     auc_pr: float
     clipped: int
+    history_fraud: int
 
 
 def make_poison(attacker_banks: set[int], kind: str, rng: np.random.Generator) -> Callable[[int, Delta, int], Delta]:
@@ -286,9 +288,18 @@ def make_poison(attacker_banks: set[int], kind: str, rng: np.random.Generator) -
     return poison
 
 
+POISON_HISTORY = (0, 500, 5000)
+
+
 def poisoning(
     X: np.ndarray, amount: np.ndarray, y: np.ndarray, mode: str, seeds: tuple[int, ...], cfg: ExpConfig, log=print
 ) -> list[PoisonTrial]:
+    """Poisoned federation, then the held-out bank fine-tunes on 0 / 500 / 5000 of its own rows.
+
+    n=0 is the setting most favourable to the attack (the poisoned global model is all the bank has).
+    n=500 / 5000 is the realistic operating case for a bank with some history; the question is how
+    much of the poison local fine-tuning recovers.
+    """
     out: list[PoisonTrial] = []
     rules = {"fedavg": FedAvg, "coord_median": CoordinateMedian, "trimmed_mean_20": lambda: TrimmedMean(0.2)}
     for seed in seeds:
@@ -298,17 +309,20 @@ def poisoning(
             others_ids = [k for k in range(N_BANKS) if k != h]
             others = {k: (X[split.bank_of_row == k], y[split.bank_of_row == k]) for k in others_ids}
             idx_h = np.where(split.bank_of_row == h)[0]
-            test = (X[idx_h], y[idx_h])
+            perm = rng.permutation(idx_h)
+            test_idx = perm[TEST_OFFSET:]  # same fixed-test-set design as the cold-start experiment
+            test = (X[test_idx], y[test_idx])
             for n_att in (0, 1, 2):
                 attackers = set(others_ids[:n_att])
                 for attack in (("none",) if n_att == 0 else ("inverted", "garbage")):
                     for rname, rfac in rules.items():
                         pz = None if n_att == 0 else make_poison(attackers, attack, np.random.default_rng(seed))
                         params, agg = run_federation(rfac(), others, cfg, seed, poison=pz)
-                        m = OnlineLogisticRegression(ULB_EVAL, cfg.train, params=params)
-                        ap = float(average_precision_score(test[1], m.predict_proba(test[0])))
                         clipped = sum(len(rep.clipped) for rep in agg.history)
-                        out.append(PoisonTrial(mode, h, seed, n_att, attack, rname, ap, clipped))
+                        for n in POISON_HISTORY:
+                            hist_idx = perm[:n]
+                            sc = finetune_and_score(params, (X[hist_idx], y[hist_idx]), test, cfg, seed)
+                            out.append(PoisonTrial(mode, h, seed, n_att, attack, rname, n, sc["auc_pr"], clipped, int(y[hist_idx].sum())))
             log(f"  [poison {mode} seed={seed} held_out=bank{h}] done")
     return out
 
@@ -316,10 +330,10 @@ def poisoning(
 # --------------------------------------------------------------------------- #
 # Report
 # --------------------------------------------------------------------------- #
-#: Row order for result tables: cells where local-only has real data first; n=0 last as the
-#: degenerate reference (local-only is a constant scorer there and cannot rank).
-TABLE_ORDER = tuple(n for n in HISTORY_SIZES if n > 0) + (0,)
-BREAKDOWN_N = (50, 500)
+#: Row order for result tables: the genuinely non-degenerate point first, then the two
+#: positive-scarce points, then n=0 as the degenerate reference.
+TABLE_ORDER = (5000, 500, 50, 0)
+CONDITION_N = (50, 500, 5000)
 
 
 def _cells(trials: list[Trial], mode: str, n: int, method: str) -> list[Trial]:
@@ -332,16 +346,30 @@ def _agg(trials: list[Trial], mode: str, n: int, method: str, metric: str = "auc
     return (float(v.mean()), float(v.std(ddof=1)) if len(v) > 1 else 0.0, len(v)) if v.size else (float("nan"), float("nan"), 0)
 
 
-def _wins(trials: list[Trial], mode: str, n: int, a: str, b: str) -> tuple[int, int]:
+def _wins(trials: list[Trial], mode: str, n: int, a: str, b: str, only_cells: Optional[set] = None) -> tuple[int, int]:
     """Paired comparison: in how many (seed, held_out) cells does method a beat method b?
 
     Invariant to per-cell normalisation: a and b share the cell's test set, so AUC-PR and lift
-    give identical win counts. Normalisation changes the cross-cell mean and spread, not this.
+    give identical win counts. ``only_cells`` restricts to a subset of (seed, held_out) keys.
     """
     cells = {(t.seed, t.held_out): t.auc_pr for t in _cells(trials, mode, n, a)}
     other = {(t.seed, t.held_out): t.auc_pr for t in _cells(trials, mode, n, b)}
-    keys = sorted(set(cells) & set(other))
+    keys = sorted(set(cells) & set(other) & (only_cells if only_cells is not None else set(cells)))
     return sum(cells[k] > other[k] for k in keys), len(keys)
+
+
+def _pos_cells(trials: list[Trial], mode: str, n: int) -> tuple[set, set, list[int]]:
+    """(cells whose local history had >=1 fraud row, cells with none, history_fraud per cell)."""
+    pos, neg, hf = set(), set(), []
+    for t in _cells(trials, mode, n, "local_only"):  # history is shared by all methods in a cell
+        (pos if t.history_fraud >= 1 else neg).add((t.seed, t.held_out))
+        hf.append(t.history_fraud)
+    return pos, neg, hf
+
+
+def _agg_cells(trials: list[Trial], mode: str, n: int, method: str, keys: set) -> float:
+    v = [t.auc_pr for t in _cells(trials, mode, n, method) if (t.seed, t.held_out) in keys]
+    return float(np.mean(v)) if v else float("nan")
 
 
 def _corr_with_prevalence(trials: list[Trial], mode: str, n: int, method: str) -> tuple[float, int]:
@@ -354,11 +382,6 @@ def _corr_with_prevalence(trials: list[Trial], mode: str, n: int, method: str) -
     if a.std() == 0 or p.std() == 0:
         return float("nan"), len(c)
     return float(np.corrcoef(a, p)[0, 1]), len(c)
-
-
-def _mean_history_fraud(trials: list[Trial], mode: str, n: int) -> float:
-    c = _cells(trials, mode, n, "local_only")
-    return float(np.mean([t.history_fraud for t in c])) if c else float("nan")
 
 
 def plot_curves(trials: list[Trial], modes: tuple[str, ...], out: Path, metric: str = "auc_pr") -> None:
@@ -375,8 +398,12 @@ def plot_curves(trials: list[Trial], modes: tuple[str, ...], out: Path, metric: 
             mu = np.array([_agg(trials, mode, n, method, metric)[0] for n in HISTORY_SIZES])
             sd = np.array([_agg(trials, mode, n, method, metric)[1] for n in HISTORY_SIZES])
             ax.errorbar(xs, mu, yerr=sd, marker="o", capsize=3, label=method)
+        labels = []
+        for n in HISTORY_SIZES:
+            pos, _, _ = _pos_cells(trials, mode, n)
+            labels.append(f"{n}\n({len(pos)}/{len(pos) + len(_pos_cells(trials, mode, n)[1])} cells w/ fraud)")
         ax.set_xticks(xs)
-        ax.set_xticklabels([("0 (degenerate)" if n == 0 else str(n)) for n in HISTORY_SIZES], fontsize=8)
+        ax.set_xticklabels(labels, fontsize=7)
         ax.set_xlabel("held-out bank's labelled history (rows)")
         ax.set_title(f"split = {mode}")
         ax.grid(alpha=0.3)
@@ -398,21 +425,25 @@ def plot_poison(pt: list[PoisonTrial], out: Path) -> None:
 
     rules = ["fedavg", "trimmed_mean_20", "coord_median"]
     conds = [(0, "none"), (1, "inverted"), (1, "garbage"), (2, "inverted"), (2, "garbage")]
-    fig, ax = plt.subplots(figsize=(8, 4))
+    hist = sorted({t.history for t in pt})
+    fig, axes = plt.subplots(1, len(hist), figsize=(5.2 * len(hist), 4), sharey=True)
+    axes = np.atleast_1d(axes)
     w = 0.25
-    for i, r in enumerate(rules):
-        mu, sd = [], []
-        for n_att, kind in conds:
-            v = np.array([t.auc_pr for t in pt if t.rule == r and t.attackers == n_att and t.attack == kind])
-            mu.append(v.mean() if v.size else np.nan)
-            sd.append(v.std(ddof=1) if v.size > 1 else 0)
-        ax.bar(np.arange(len(conds)) + (i - 1) * w, mu, w, yerr=sd, capsize=2, label=r)
-    ax.set_xticks(np.arange(len(conds)))
-    ax.set_xticklabels([f"{n} attacker{'s' if n != 1 else ''}\n{k}" for n, k in conds], fontsize=8)
-    ax.set_ylabel("AUC-PR on held-out bank, 0 history")
-    ax.set_title("Poisoned deltas: aggregation rule robustness (4 contributing banks)")
-    ax.legend(fontsize=8)
-    ax.grid(axis="y", alpha=0.3)
+    for ax, n in zip(axes, hist):
+        for i, r in enumerate(rules):
+            mu, sd = [], []
+            for n_att, kind in conds:
+                v = np.array([t.auc_pr for t in pt if t.rule == r and t.attackers == n_att and t.attack == kind and t.history == n])
+                mu.append(v.mean() if v.size else np.nan)
+                sd.append(v.std(ddof=1) if v.size > 1 else 0)
+            ax.bar(np.arange(len(conds)) + (i - 1) * w, mu, w, yerr=sd, capsize=2, label=r)
+        ax.set_xticks(np.arange(len(conds)))
+        ax.set_xticklabels([f"{a} att.\n{k}" for a, k in conds], fontsize=8)
+        ax.set_title(f"held-out bank fine-tunes on {n} rows" + (" (attack-favourable)" if n == 0 else ""), fontsize=10)
+        ax.grid(axis="y", alpha=0.3)
+    axes[0].set_ylabel("AUC-PR on held-out bank")
+    axes[-1].legend(fontsize=8)
+    fig.suptitle("Poisoned deltas: aggregation-rule robustness (4 contributing banks)", fontsize=11)
     fig.tight_layout()
     fig.savefig(out, dpi=130)
     plt.close(fig)
@@ -433,6 +464,7 @@ def render_report(
     plot_curves(trials, modes, out_dir / "cold_start_lift.png", "lift")
     if pt:
         plot_poison(pt, out_dir / "poisoning.png")
+    n_cells = len(seeds) * N_BANKS
 
     md: list[str] = []
     md.append("# Kavach v2 — Federated Cold-Start Experiment\n")
@@ -461,14 +493,14 @@ as a property of the federated-learning machinery, not of Kavach's fraud detecti
   labelled history (n ∈ {list(HISTORY_SIZES)}), rows beyond position {TEST_OFFSET} form a **fixed test set** so
   all history sizes are scored on identical rows.
 - **Methods compared on the held-out bank**, each followed by the *same* {cfg.finetune_epochs}-epoch fine-tune on the *n* history rows:
-  - `local_only` — from zero weights. **At n=0 this is a constant scorer** — every row gets the same probability,
-    so it cannot rank and its AUC-PR equals the prevalence (lift exactly 1.0). Comparisons at n=0 are against a
-    model that cannot do the task; they are reported as the degenerate reference, not as the result.
+  - `local_only` — from zero weights. **Degenerate whenever its history contains no fraud row**: with no positive
+    example it cannot learn a ranking direction. At n=0 that is every cell; at n=50 it is almost every cell (see the
+    "cells with ≥1 fraud" column). Comparisons in those cells are against a model that cannot do the task.
   - `fedavg` — FedAvg global model learned from the other {N_BANKS - 1} banks' deltas.
   - `coord_median` — same, coordinate-median aggregation.
   - `pooled` — the other banks' raw rows pooled centrally, {cfg.pooled_epochs} epochs. **Upper bound**: what federation
     is trying to approach without anyone pooling data.
-- **Seeds:** {list(seeds)} → {len(seeds) * N_BANKS} (seed × held-out bank) cells per split per history size.
+- **Seeds:** {list(seeds)} → {n_cells} (seed × held-out bank) cells per split per history size.
 - **Metrics:** AUC-PR on the held-out bank's test rows, **and lift = AUC-PR / that cell's own prevalence.**
   AUC-PR's floor is the prevalence, and held-out prevalence varies several-fold across banks under the non-IID
   splits, so a raw cross-bank mean mixes scales and its sd includes base-rate variation. Lift puts every cell on
@@ -486,81 +518,126 @@ as a property of the federated-learning machinery, not of Kavach's fraud detecti
         for b in s.per_bank:
             md.append(f"| bank{b['bank']} | {b['n']:,} | {b['fraud']} | {100 * b['prevalence']:.3f}% | {b['median_amount']:.2f} |")
         prevs = [b["prevalence"] for b in s.per_bank]
-        md.append(f"\nPrevalence ratio across banks (max/min): **{max(prevs) / min(prevs):.1f}×**.\n")
+        md.append(f"\nPrevalence ratio across banks (max/min): **{max(prevs) / min(prevs):.1f}×** (seed {seeds[0]}).\n")
 
     # ---- result 1 ----------------------------------------------------------
-    md.append("## Result 1 — cold-start curves\n")
-    md.append("Raw AUC-PR (left figure) and lift over each cell's prevalence floor (right figure, log scale).\n")
+    md.append("## Result 1 — cold start\n")
+    md.append("Raw AUC-PR (left figure) and lift over each cell's prevalence floor (right figure, log scale). X-axis labels show how many of the cells had at least one fraud row in the held-out bank's history.\n")
     md.append("![cold start](cold_start_curves.png)\n\n![cold start lift](cold_start_lift.png)\n")
 
     for mode in modes:
-        md.append(f"### `{mode}` — held-out bank, mean ± sd over {len(seeds) * N_BANKS} cells; each cell shows AUC-PR and lift\n")
-        md.append("| History rows | fraud rows in history (mean) | " + " | ".join(f"`{m}`" for m in METHODS) + " | fedavg beats local (cells) | pooled − fedavg (AUC-PR) |")
-        md.append("|---|---|" + "---|" * len(METHODS) + "---|---|")
+        md.append(f"### `{mode}` — held-out bank, mean ± sd over {n_cells} cells; each cell shows AUC-PR and lift\n")
+        md.append("| History rows | cells with ≥1 fraud in history | fraud rows in history min/mean/max | " + " | ".join(f"`{m}`" for m in METHODS) + " | fedavg beats local (cells) | pooled − fedavg (AUC-PR) |")
+        md.append("|---|---|---|" + "---|" * len(METHODS) + "---|---|")
         for n in TABLE_ORDER:
-            label = f"{n}" if n > 0 else "0 — *degenerate reference*"
+            pos, neg, hf = _pos_cells(trials, mode, n)
+            label = f"**{n}**" if n == 5000 else (f"{n}" if n > 0 else "0 — *degenerate*")
             cells = [_fmt_cell(trials, mode, n, m) for m in METHODS]
             w, tot = _wins(trials, mode, n, "fedavg", "local_only")
             gap = _agg(trials, mode, n, "pooled")[0] - _agg(trials, mode, n, "fedavg")[0]
-            md.append(f"| {label} | {_mean_history_fraud(trials, mode, n):.1f} | " + " | ".join(cells) + f" | {w}/{tot} | {gap:+.3f} |")
+            md.append(
+                f"| {label} | {len(pos)}/{len(pos) + len(neg)} | {min(hf)}/{np.mean(hf):.1f}/{max(hf)} | "
+                + " | ".join(cells) + f" | {w}/{tot} | {gap:+.3f} |"
+            )
         md.append("")
 
-    # ---- reading the curves -------------------------------------------------
-    md.append("### Reading the curves\n")
+    # ---- conditioning on positives ----------------------------------------
+    md.append("### Conditioning on whether local-only had a fraud row to learn from\n")
     md.append(
-        "The result is the **n=50 and n=500 rows**: there the local-only model has real labelled data — on average "
-        + ", ".join(f"{_mean_history_fraud(trials, modes[0], n):.1f} fraud rows at n={n}" for n in (50, 500))
-        + " — and is genuinely trying to rank.\n"
+        "The same cells, split by whether the held-out bank's *n*-row history contained at least one fraud row. "
+        "Local-only cannot rank without one; federation does not need one. Means are AUC-PR over the cells in that condition.\n"
     )
     for mode in modes:
-        parts = []
-        for n in (50, 500, 5000):
-            f_ap, l_ap = _agg(trials, mode, n, "fedavg")[0], _agg(trials, mode, n, "local_only")[0]
-            f_l, l_l = _agg(trials, mode, n, "fedavg", "lift")[0], _agg(trials, mode, n, "local_only", "lift")[0]
-            w, t = _wins(trials, mode, n, "fedavg", "local_only")
-            parts.append(f"n={n}: federated {f_ap:.3f} vs local {l_ap:.3f} AUC-PR (lift {f_l:.0f}× vs {l_l:.0f}×), wins {w}/{t}")
-        p50 = _agg(trials, mode, 50, "pooled")[0]
-        f50 = _agg(trials, mode, 50, "fedavg")[0]
-        l50 = _agg(trials, mode, 50, "local_only")[0]
-        md.append(f"- **`{mode}`:** " + "; ".join(parts) + f". At n=50 federation captures {100 * (f50 - l50) / (p50 - l50) if p50 > l50 else float('nan'):.0f}% of the pooled-vs-local gap.")
+        md.append(f"#### `{mode}`\n")
+        md.append("| History rows | condition | cells | `local_only` | `fedavg` | `coord_median` | `pooled` | fedavg beats local |")
+        md.append("|---|---|---|---|---|---|---|---|")
+        for n in CONDITION_N:
+            pos, neg, _ = _pos_cells(trials, mode, n)
+            for cond, keys in (("≥1 fraud row", pos), ("no fraud row", neg)):
+                if not keys:
+                    md.append(f"| {n} | {cond} | 0 | — | — | — | — | — |")
+                    continue
+                w, tot = _wins(trials, mode, n, "fedavg", "local_only", only_cells=keys)
+                md.append(
+                    f"| {n} | {cond} | {len(keys)} | "
+                    + " | ".join(f"{_agg_cells(trials, mode, n, m, keys):.3f}" for m in METHODS)
+                    + f" | {w}/{tot} |"
+                )
+        md.append("")
+
+    # ---- reading -------------------------------------------------------------
+    md.append("### Reading Result 1\n")
+    md.append(
+        "**The headline is n=5000, the only history size at which every cell's local model had fraud rows to learn from** "
+        "(minimum "
+        + ", ".join(f"{min(_pos_cells(trials, m, 5000)[2])} under `{m}`" for m in modes)
+        + "). There the baseline is genuinely trying and federation still wins:\n"
+    )
+    for mode in modes:
+        f_ap, l_ap = _agg(trials, mode, 5000, "fedavg")[0], _agg(trials, mode, 5000, "local_only")[0]
+        m_ap, p_ap = _agg(trials, mode, 5000, "coord_median")[0], _agg(trials, mode, 5000, "pooled")[0]
+        w, t = _wins(trials, mode, 5000, "fedavg", "local_only")
+        wm, _ = _wins(trials, mode, 5000, "coord_median", "local_only")
+        md.append(
+            f"- **`{mode}`, n=5000:** local-only {l_ap:.3f} → FedAvg **{f_ap:.3f}** (wins {w}/{t}), coordinate-median {m_ap:.3f} (wins {wm}/{t}); "
+            f"pooled upper bound {p_ap:.3f}. Federation closes {100 * (f_ap - l_ap) / (p_ap - l_ap) if p_ap > l_ap else float('nan'):.0f}% of the pooled-vs-local gap."
+        )
     md.append("")
     md.append(
-        "**Does the win hold on lift?** Per-cell win counts are the same under lift by construction (shared test set). "
-        "The cross-bank *means* are what lift changes, and the federated-over-local ordering of means is preserved in every split "
-        "and every history size above — the claim does not depend on which scale is used.\n"
+        "**n=50 is near-degenerate and n=500 is mixed.** At n=50 only "
+        + "/".join(f"{len(_pos_cells(trials, m, 50)[0])}" for m in modes)
+        + f" of {n_cells} cells (by split) had any fraud row in the history; at n=500, "
+        + "/".join(f"{len(_pos_cells(trials, m, 500)[0])}" for m in modes)
+        + ". In cells with **no** fraud row local-only sits near its prevalence floor and federation wins every cell — but that is the "
+        "n=0 comparison again, not a new result. In the n=500 cells that **did** contain a fraud row, local-only jumps to "
+        + ", ".join(f"{_agg_cells(trials, m, 500, 'local_only', _pos_cells(trials, m, 500)[0]):.3f}" for m in modes)
+        + " (by split) and federation's margin shrinks to "
+        + ", ".join(
+            f"{_agg_cells(trials, m, 500, 'fedavg', _pos_cells(trials, m, 500)[0]) - _agg_cells(trials, m, 500, 'local_only', _pos_cells(trials, m, 500)[0]):+.3f} ({_wins(trials, m, 500, 'fedavg', 'local_only', _pos_cells(trials, m, 500)[0])[0]}/{_wins(trials, m, 500, 'fedavg', 'local_only', _pos_cells(trials, m, 500)[0])[1]})"
+            for m in modes
+        )
+        + ".\n"
     )
     md.append(
-        "**n=0 is the degenerate reference.** `local_only` at n=0 is a constant scorer (lift 1.0 in every cell); the "
-        + "/".join(f"{_wins(trials, m, 0, 'fedavg', 'local_only')[0]}" for m in modes)
-        + f" of {len(seeds) * N_BANKS} wins there say only that a model beats no model. They are not the headline.\n"
+        "**What federation actually fixes here is positive-class scarcity, not sample scarcity.** A new bank has plenty of "
+        "transactions and almost no confirmed fraud labels. One fraud row in the local history moves local-only from ≈0.01 to "
+        "≈0.5–0.7 AUC-PR; the other 499 legitimate rows barely matter. The federated baseline supplies the ranking direction that "
+        "only positives can teach, from banks that have them. That is the mechanism, and it is a narrower claim than \"federation "
+        "beats local at cold start\": at every history size where the local model has seen a handful of frauds, the advantage is "
+        "real but modest (≈+0.06 to +0.10 AUC-PR at n=5000), and it would shrink further with a stronger local learner.\n"
+    )
+    md.append(
+        "**Lift.** Per-cell win counts are the same under lift by construction (shared test set). The cross-bank means are what "
+        "lift changes, and the federated-over-local ordering of means is preserved in every split and every history size.\n"
     )
 
     # ---- per-held-out-bank breakdown --------------------------------------
     md.append("### Per-held-out-bank breakdown (attributing the spread)\n")
     md.append(
-        "Mean over seeds for each held-out bank. `prev` is that bank's test-set prevalence — the AUC-PR floor for its row. "
-        "Where AUC-PR tracks `prev` down a column, the cross-bank sd is base rate, not method.\n"
+        "Mean over seeds for each held-out bank at n=500 and n=5000. `prev` is that bank's test-set prevalence — the AUC-PR "
+        "floor for its row. Where AUC-PR tracks `prev` down a column, the cross-bank sd is base rate, not method.\n"
     )
     for mode in modes:
         md.append(f"#### `{mode}`\n")
-        hdr = "| Held-out | prev | " + " | ".join(f"`{m}` n={n}" for n in BREAKDOWN_N for m in METHODS) + " |"
+        bn = (500, 5000)
+        hdr = "| Held-out | prev | " + " | ".join(f"`{m}` n={n}" for n in bn for m in METHODS) + " |"
         md.append(hdr)
-        md.append("|---|---|" + "---|" * (len(BREAKDOWN_N) * len(METHODS)))
+        md.append("|---|---|" + "---|" * (len(bn) * len(METHODS)))
         for h in range(N_BANKS):
             row_cells = []
             prev = np.mean([t.prevalence for t in trials if t.split == mode and t.held_out == h and t.history == 0 and t.method == "fedavg"])
-            for n in BREAKDOWN_N:
+            for n in bn:
                 for m in METHODS:
                     c = [t for t in _cells(trials, mode, n, m) if t.held_out == h]
                     ap = np.mean([t.auc_pr for t in c]) if c else float("nan")
                     lf = np.mean([t.lift for t in c]) if c else float("nan")
                     row_cells.append(f"{ap:.3f}<br><sub>{lf:.0f}×</sub>")
             md.append(f"| bank{h} | {100 * prev:.3f}% | " + " | ".join(row_cells) + " |")
-        r_f, k = _corr_with_prevalence(trials, mode, 500, "fedavg")
-        r_l, _ = _corr_with_prevalence(trials, mode, 500, "local_only")
-        r_p, _ = _corr_with_prevalence(trials, mode, 500, "pooled")
+        r_f, k = _corr_with_prevalence(trials, mode, 5000, "fedavg")
+        r_l, _ = _corr_with_prevalence(trials, mode, 5000, "local_only")
+        r_p, _ = _corr_with_prevalence(trials, mode, 5000, "pooled")
         md.append(
-            f"\nPearson r between a cell's AUC-PR and its prevalence at n=500 ({k} cells): fedavg **{r_f:+.2f}**, "
+            f"\nPearson r between a cell's AUC-PR and its prevalence at n=5000 ({k} cells): fedavg **{r_f:+.2f}**, "
             f"local-only {r_l:+.2f}, pooled {r_p:+.2f}. "
             + ("A strong positive r means most of the raw sd in that column is base rate." if np.isfinite(r_f) and abs(r_f) > 0.5 else "A weak r means the spread is mostly method/seed variance, not base rate.")
             + "\n"
@@ -586,32 +663,68 @@ as a property of the federated-learning machinery, not of Kavach's fraud detecti
     if pt:
         md.append("## Result 2 — poisoned deltas (§5.4)\n")
         mode = pt[0].split
+        hist = sorted({t.history for t in pt})
         md.append(
-            f"""Split `{mode}`, every bank held out in turn, seeds {list(seeds)}, **0 local history** (pure
-cold start, so the global model is all the held-out bank has). Of the {N_BANKS - 1} contributing banks,
-0, 1 or 2 are attackers. An attacker replaces its honest delta with either **inverted** (−10× the
-honest delta) or **garbage** (N(0, 5²) noise), and **claims 20× its true sample count** to dominate a
-weighted average. Delta norm clipping (50) applies to all rules.
+            f"""Split `{mode}`, every bank held out in turn, seeds {list(seeds)}. Of the {N_BANKS - 1} contributing banks, 0, 1 or 2 are
+attackers. An attacker replaces its honest delta with either **inverted** (−10× the honest delta) or **garbage**
+(N(0, 5²) noise), and **claims 20× its true sample count** to dominate a weighted average. Delta norm clipping (50)
+applies to all rules. After aggregation the held-out bank fine-tunes the (possibly poisoned) global model on
+{", ".join(str(n) for n in hist)} rows of its own history and is scored on its fixed test set.
+
+**Which setting is realistic.** n=0 is the setting most favourable to the attack: the poisoned global model is all
+the bank has. It is the brand-new-bank case and it is where the damage is largest. n=500 / n=5000 is the operating
+case for a bank that has been live for a while; the question there is how much of the poison local fine-tuning
+recovers — and, given Result 1, recovery depends on whether the local history contains fraud rows.
 
 ![poisoning](poisoning.png)
-
-| Attackers | Attack | `fedavg` | `trimmed_mean_20` | `coord_median` |
-|---|---|---|---|---|"""
+"""
         )
+        md.append("| Attackers | Attack | " + " | ".join(f"`{r}` n={n}" for n in hist for r in ("fedavg", "coord_median")) + " |")
+        md.append("|---|---|" + "---|" * (2 * len(hist)))
         for n_att, kind in [(0, "none"), (1, "inverted"), (1, "garbage"), (2, "inverted"), (2, "garbage")]:
             row = [f"{n_att}", kind]
-            for r in ("fedavg", "trimmed_mean_20", "coord_median"):
-                v = np.array([t.auc_pr for t in pt if t.rule == r and t.attackers == n_att and t.attack == kind])
-                row.append(f"{v.mean():.3f} ± {v.std(ddof=1) if v.size > 1 else 0:.3f}" if v.size else "n/a")
+            for n in hist:
+                for r in ("fedavg", "coord_median"):
+                    v = np.array([t.auc_pr for t in pt if t.rule == r and t.attackers == n_att and t.attack == kind and t.history == n])
+                    row.append(f"{v.mean():.3f} ± {v.std(ddof=1) if v.size > 1 else 0:.3f}" if v.size else "n/a")
             md.append("| " + " | ".join(row) + " |")
+        md.append("")
+        # computed reading
+        def _m(rule, n_att, kind, n):
+            v = np.array([t.auc_pr for t in pt if t.rule == rule and t.attackers == n_att and t.attack == kind and t.history == n])
+            return float(v.mean()) if v.size else float("nan")
+
+        lines = []
+        base_inv, base_garb2 = _m("fedavg", 1, "inverted", 0), _m("fedavg", 2, "garbage", 0)
+        for n in hist:
+            clean = _m("fedavg", 0, "none", n)
+            fa_inv, cm_inv = _m("fedavg", 1, "inverted", n), _m("coord_median", 1, "inverted", n)
+            fa_g2, cm_g2 = _m("fedavg", 2, "garbage", n), _m("coord_median", 2, "garbage", n)
+            hf = np.mean([t.history_fraud for t in pt if t.history == n])
+            rec_inv = max(0.0, (fa_inv - base_inv) / max(clean - base_inv, 1e-9))
+            rec_g2 = max(0.0, (fa_g2 - base_garb2) / max(clean - base_garb2, 1e-9))
+            tail = "" if n == 0 else f" Relative to n=0, local fine-tuning recovers **{100 * rec_inv:.0f}%** of FedAvg's loss under one inverted attacker and {100 * rec_g2:.0f}% under two garbage attackers."
+            lines.append(
+                f"- **n={n}** (mean {hf:.1f} fraud rows in history): clean FedAvg {clean:.3f}; one inverted attacker -> FedAvg **{fa_inv:.3f}**, "
+                f"coordinate-median **{cm_inv:.3f}**; two garbage attackers -> FedAvg {fa_g2:.3f}, coordinate-median {cm_g2:.3f}.{tail}"
+            )
+        md.append("\n".join(lines))
         md.append(
             f"""
-Coordinate-median tolerates strictly fewer than half of the participants being malicious. With
-{N_BANKS - 1} contributors that means **1 attacker is inside its breakdown point and 2 is at it** — the
-2-attacker rows are expected to show degradation for *every* rule, and they are reported precisely
-because they are the honest edge of the guarantee. With 20% trimming on 4 participants the trimmed
-mean removes 0 values per side and falls back to the median, so `trimmed_mean_20` ≈ `coord_median`
-here; it separates from it only with more participants.
+**Reading.** The realistic operating case is no more forgiving than the attack-favourable one. Under the same
+{cfg.finetune_epochs}-epoch fine-tune budget used everywhere in Result 1, a held-out bank with thousands of rows and ~10 fraud
+labels does not pull a FedAvg model back from a single inverted attacker: the poisoned weights sit far from the origin
+and SGD at this budget does not return them. Coordinate-median is the defence at every history size, not just at
+cold start. The design implication is Section 5.5's: a bank should score the incoming global model on its own labelled
+history *before* adopting it and fall back to its last good model (or to human review) when that score collapses -
+detection, not recovery, is what local data buys against a poisoned aggregate.
+
+`trimmed_mean_20` equals `coord_median` here (20% trimming of 4 participants removes 0 per side and falls back to the median);
+it is in the figure and the JSON but omitted from the table.
+
+Coordinate-median tolerates strictly fewer than half of the participants being malicious. With {N_BANKS - 1} contributors that
+means **1 attacker is inside its breakdown point and 2 is at it** — the 2-attacker rows are expected to show degradation for
+*every* rule, and they are reported because they are the honest edge of the guarantee.
 """
         )
 
@@ -626,15 +739,17 @@ here; it separates from it only with more participants.
 1. Card fraud, not UPI social engineering; PCA features, not Kavach's contract. Mechanism result only.
 2. "Banks" are synthetic partitions of one dataset. Real banks differ in ways a mixing matrix does not capture
    (different fraud typologies, different labelling latency and quality, different base rates by an order of magnitude).
-3. Logistic regression is a deliberately simple learner. The federated-vs-local *gap* is what is being measured, and a
-   stronger local learner would shrink it at large history — the small-history end of the curve is the claim, not the right end.
-4. Attackers here are crude (sign flip, noise, inflated counts). A stealthy attacker who shifts deltas by a small,
+3. Logistic regression is a deliberately simple learner. The federated-vs-local *gap* at n=5000 (≈+0.06 to +0.10) is what is
+   being claimed, and a stronger local learner would shrink it.
+4. n=50 and most of n=500 compare against a local model with no positive examples; those cells restate the n=0 result and are
+   labelled as such. The conditioned tables are the honest view of n=500.
+5. Attackers here are crude (sign flip, noise, inflated counts). A stealthy attacker who shifts deltas by a small,
    consistent amount every round is not tested and is *not* defeated by a median.
-5. No differential privacy or secure aggregation: the aggregator sees each bank's delta in the clear. "No raw data leaves
+6. No differential privacy or secure aggregation: the aggregator sees each bank's delta in the clear. "No raw data leaves
    the bank" is true; "nothing about the bank's data can be inferred from its delta" is not claimed.
-6. Fine-tune epochs, rounds and learning rate were set once, not tuned per method. Tuning would move numbers, not the shape.
-7. Result 3 uses the same global model at every bank so that only the cutoffs differ; in deployment each bank also
-   fine-tunes, which would change the score distributions the cutoffs are calibrated on.
+7. Fine-tune epochs, rounds and learning rate were set once, not tuned per method. Tuning would move numbers, not the shape.
+8. Result 3's scope is stated in its own section: most rows isolate the cutoff effect with one shared model; one row tests the
+   full global + fine-tune + per-bank-cutoff stack.
 """
     )
     if elapsed_s is not None and elapsed_s > 0:
@@ -725,8 +840,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"[fed] report -> {path} ({elapsed / 60:.1f} min)")
     for mode in modes:
         for n in TABLE_ORDER:
-            cells = "  ".join(f"{m}={_agg(trials, mode, n, m)[0]:.3f}({_agg(trials, mode, n, m, 'lift')[0]:.0f}x)" for m in METHODS)
-            print(f"  {mode:8s} n={n:<5d} {cells}")
+            pos, neg, _ = _pos_cells(trials, mode, n)
+            cells = "  ".join(f"{m}={_agg(trials, mode, n, m)[0]:.3f}" for m in METHODS)
+            print(f"  {mode:8s} n={n:<5d} cells_with_fraud={len(pos)}/{len(pos) + len(neg)}  {cells}")
     return 0
 
 

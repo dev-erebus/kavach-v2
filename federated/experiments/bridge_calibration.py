@@ -14,8 +14,11 @@ For each split and seed:
 1. Train ONE FedAvg global model over all 5 banks (5 rounds). Every bank scores with this
    same model, so the only thing that differs between conditions is the cutoffs. (Per-bank
    fine-tuning would confound the comparison; it is deliberately switched off here.)
-2. Each bank's rows are split 50/50 into a *calibration* half and an *evaluation* half.
-3. Four cutoff strategies, two operating-point definitions × {global, per-bank}:
+2. Each bank's rows are split into thirds: a *fit* third (used only by the full-stack row
+   below), a *calibration* third, and an *evaluation* third. Every strategy is scored on
+   the same evaluation third.
+3. Four cutoff strategies, two operating-point definitions × {global, per-bank}, plus one
+   full-stack row:
 
    **Flag-rate targets** (unlabelled; what a bank can do on day one — "we can afford to
    review 1% of traffic at L2"):
@@ -27,7 +30,14 @@ For each split and seed:
      - ``global_precision``  — cutoffs from pooled labelled calibration data.
      - ``perbank_precision`` — each bank's cutoffs from its own labelled calibration data.
 
-4. Every strategy is evaluated on every bank's evaluation half: per level (≥L1/≥L2/≥L3)
+   **Full stack** (the brief's actual §2.2 configuration — global baseline + local
+   fine-tuning + per-bank cutoff):
+     - ``fullstack_flagrate`` — each bank fine-tunes the global model on its *fit* third,
+       calibrates flag-rate cutoffs on its *calibration* third with that fine-tuned model,
+       and is evaluated on its *evaluation* third. The other four rows hold the model fixed
+       to isolate the cutoff effect; this row tests the combination the brief describes.
+
+4. Every strategy is evaluated on every bank's evaluation third: per level (≥L1/≥L2/≥L3)
    precision, recall, and alert volume (flag rate) — plus the cutoffs themselves, so the
    report can say how different the per-bank cutoffs actually are.
 
@@ -67,7 +77,7 @@ from .cold_start import ExpConfig, N_BANKS, Split, make_split, run_federation
 
 FLAG_TARGETS = FlagRateTargets(l1=0.05, l2=0.01, l3=0.001)
 PRECISION_TARGETS = (0.02, 0.10, 0.50)  # ≥L1, ≥L2, ≥L3
-STRATEGIES = ("global_flagrate", "perbank_flagrate", "global_precision", "perbank_precision")
+STRATEGIES = ("global_flagrate", "perbank_flagrate", "global_precision", "perbank_precision", "fullstack_flagrate")
 LEVELS = (ThreatLevel.L1, ThreatLevel.L2, ThreatLevel.L3)
 
 
@@ -120,12 +130,17 @@ def run_bridge_experiment(
 
             cal: dict[int, tuple[np.ndarray, np.ndarray]] = {}
             ev: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+            fit: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+            ev_X: dict[int, np.ndarray] = {}
+            cal_X: dict[int, np.ndarray] = {}
             for k in range(N_BANKS):
                 idx = np.where(split.bank_of_row == k)[0]
                 perm = rng.permutation(idx)
-                half = len(perm) // 2
-                cal[k] = (model.predict_proba(X[perm[:half]]), y[perm[:half]])
-                ev[k] = (model.predict_proba(X[perm[half:]]), y[perm[half:]])
+                a, b = len(perm) // 3, 2 * len(perm) // 3
+                fit[k] = (X[perm[:a]], y[perm[:a]])
+                cal_X[k], ev_X[k] = X[perm[a:b]], X[perm[b:]]
+                cal[k] = (model.predict_proba(cal_X[k]), y[perm[a:b]])
+                ev[k] = (model.predict_proba(ev_X[k]), y[perm[b:]])
 
             pooled_p = np.concatenate([cal[k][0] for k in range(N_BANKS)])
             pooled_y = np.concatenate([cal[k][1] for k in range(N_BANKS)])
@@ -134,18 +149,25 @@ def run_bridge_experiment(
 
             for k in range(N_BANKS):
                 pc, yc = cal[k]
-                strategies = {
-                    "global_flagrate": global_fr,
-                    "perbank_flagrate": calibrate_by_flag_rate(pc, FLAG_TARGETS),
-                    "global_precision": global_pr,
-                    "perbank_precision": calibrate_by_precision(pc, yc, PRECISION_TARGETS) if yc.sum() > 0 else global_pr,
-                }
                 pe, ye = ev[k]
-                for sname, cuts in strategies.items():
+                # Full stack: this bank's live model = global + fine-tune on its fit third.
+                local = OnlineLogisticRegression(ULB_EVAL, cfg.train, params=params)
+                local.fit_epochs(fit[k][0], fit[k][1], np.random.default_rng(seed * 10 + k), epochs=cfg.finetune_epochs)
+                fs_cuts = calibrate_by_flag_rate(local.predict_proba(cal_X[k]), FLAG_TARGETS)
+                pe_local = local.predict_proba(ev_X[k])
+
+                strategies = {
+                    "global_flagrate": (global_fr, pe),
+                    "perbank_flagrate": (calibrate_by_flag_rate(pc, FLAG_TARGETS), pe),
+                    "global_precision": (global_pr, pe),
+                    "perbank_precision": (calibrate_by_precision(pc, yc, PRECISION_TARGETS) if yc.sum() > 0 else global_pr, pe),
+                    "fullstack_flagrate": (fs_cuts, pe_local),
+                }
+                for sname, (cuts, scores) in strategies.items():
                     for L in LEVELS:
                         c = _cut_for(cuts, L)
-                        alerts, tp, fr, prec, rec = _eval_level(pe, ye, c)
-                        trials.append(BridgeTrial(mode, seed, k, sname, L.name, c, len(pe), int(ye.sum()), alerts, tp, fr, prec, rec))
+                        alerts, tp, fr, prec, rec = _eval_level(scores, ye, c)
+                        trials.append(BridgeTrial(mode, seed, k, sname, L.name, c, len(scores), int(ye.sum()), alerts, tp, fr, prec, rec))
             log(f"  [bridge {mode} seed={seed}] done")
     return trials, splits
 
@@ -180,16 +202,23 @@ def render_bridge_section(trials: list[BridgeTrial], modes: tuple[str, ...], see
     md.append("## Result 3 — threshold bridge: per-bank calibrated cutoffs vs one global cutoff\n")
     md.append(
         f"""This is the mechanism the brief actually promises for Component B (§2.3). One FedAvg global model
-is trained over all {N_BANKS} banks per (split, seed) and used as the scorer everywhere; each bank's rows are
-split 50/50 into calibration and evaluation halves; only the **cutoffs** differ between conditions.
+is trained over all {N_BANKS} banks per (split, seed); each bank's rows are split into a *fit* third, a *calibration*
+third and an *evaluation* third, and every strategy is scored on the same evaluation third.
+
+**Scope — read before the tables.** Four of the five rows use that single global model as the scorer at every bank,
+so that **only the cutoffs differ** between conditions. That isolates the cutoff effect, but it means those rows test
+*per-bank cutoffs*, not the brief's full "global baseline + local fine-tuning + per-bank cutoff" stack (§2.2). The
+fifth row, `fullstack_flagrate`, adds the missing piece: each bank fine-tunes the global model on its fit third, then
+calibrates per-bank flag-rate cutoffs with its own fine-tuned model. Where the full stack differs from
+`perbank_flagrate`, the difference is the local fine-tuning, not the cutoffs.
 
 - **Flag-rate targets** (unlabelled, day-one): ≥L1 {FLAG_TARGETS.l1:.0%}, ≥L2 {FLAG_TARGETS.l2:.0%}, ≥L3 {FLAG_TARGETS.l3:.1%} of traffic.
   `global_flagrate` = one cutoff set from pooled calibration scores (the v1 "single number" analogue);
-  `perbank_flagrate` = each bank's own.
+  `perbank_flagrate` = each bank's own; `fullstack_flagrate` = each bank's own, with its fine-tuned model.
 - **Precision targets** (labelled, after `/feedback`): ≥L1 {PRECISION_TARGETS[0]:.0%}, ≥L2 {PRECISION_TARGETS[1]:.0%}, ≥L3 {PRECISION_TARGETS[2]:.0%}.
   `global_precision` from pooled labelled calibration data; `perbank_precision` from each bank's own.
 
-Cells: {N_BANKS} banks × {len(seeds)} seeds = {N_BANKS * len(seeds)} per split. Fraud counts per bank-half are small
+Cells: {N_BANKS} banks × {len(seeds)} seeds = {N_BANKS * len(seeds)} per split. Fraud counts per bank-third are small
 (tens), so ≥L3 precision/recall are noisy; read ≥L2 as the main operating point.
 """
     )
@@ -198,17 +227,18 @@ Cells: {N_BANKS} banks × {len(seeds)} seeds = {N_BANKS * len(seeds)} per split.
         md.append(f"### `{mode}`\n")
         # --- alert-volume adherence (flag-rate strategies) -------------------
         md.append("**Alert volume per bank at ≥L2 (target 1.00% of each bank's traffic)** — mean over seeds:\n")
-        hdr = "| Bank | eval prevalence | `global_flagrate` flag rate | `perbank_flagrate` flag rate | global recall | per-bank recall | global precision | per-bank precision |"
+        hdr = "| Bank | eval prevalence | `global_flagrate` flag rate | `perbank_flagrate` flag rate | `fullstack_flagrate` flag rate | global recall | per-bank recall | full-stack recall | global precision | per-bank precision | full-stack precision |"
         md.append(hdr)
-        md.append("|---|---|---|---|---|---|---|---|")
+        md.append("|---|---|---|---|---|---|---|---|---|---|---|")
         for k in range(N_BANKS):
             g = _sel(trials, split=mode, bank=k, strategy="global_flagrate", level="L2")
             p = _sel(trials, split=mode, bank=k, strategy="perbank_flagrate", level="L2")
+            fs = _sel(trials, split=mode, bank=k, strategy="fullstack_flagrate", level="L2")
             prev = _mean([t.n_fraud_eval / t.n_eval for t in g])
             md.append(
-                f"| bank{k} | {_pct(prev, 3)} | {_pct(_mean([t.flag_rate for t in g]))} | {_pct(_mean([t.flag_rate for t in p]))} | "
-                f"{_pct(_mean([t.recall for t in g]), 1)} | {_pct(_mean([t.recall for t in p]), 1)} | "
-                f"{_pct(_mean([t.precision for t in g]), 1)} | {_pct(_mean([t.precision for t in p]), 1)} |"
+                f"| bank{k} | {_pct(prev, 3)} | {_pct(_mean([t.flag_rate for t in g]))} | {_pct(_mean([t.flag_rate for t in p]))} | {_pct(_mean([t.flag_rate for t in fs]))} | "
+                f"{_pct(_mean([t.recall for t in g]), 1)} | {_pct(_mean([t.recall for t in p]), 1)} | {_pct(_mean([t.recall for t in fs]), 1)} | "
+                f"{_pct(_mean([t.precision for t in g]), 1)} | {_pct(_mean([t.precision for t in p]), 1)} | {_pct(_mean([t.precision for t in fs]), 1)} |"
             )
         # dispersion of global flag rate across banks vs target
         g_rates = [t.flag_rate for t in _sel(trials, split=mode, strategy="global_flagrate", level="L2")]
@@ -227,7 +257,7 @@ Cells: {N_BANKS} banks × {len(seeds)} seeds = {N_BANKS * len(seeds)} per split.
         md.append("| Level | Strategy | total alerts / seed | total TP / seed | pooled precision | pooled recall |")
         md.append("|---|---|---|---|---|---|")
         for L in ("L1", "L2", "L3"):
-            for s in ("global_flagrate", "perbank_flagrate"):
+            for s in ("global_flagrate", "perbank_flagrate", "fullstack_flagrate"):
                 rows = _sel(trials, split=mode, strategy=s, level=L)
                 per_seed_alerts = [sum(t.alerts for t in rows if t.seed == sd) for sd in seeds]
                 per_seed_tp = [sum(t.tp for t in rows if t.seed == sd) for sd in seeds]
@@ -262,7 +292,7 @@ Cells: {N_BANKS} banks × {len(seeds)} seeds = {N_BANKS * len(seeds)} per split.
         md.append("**How different are the per-bank cutoffs?** (probability cutoff for ≥L2, mean over seeds; global cutoff for reference)\n")
         md.append("| | " + " | ".join(f"bank{k}" for k in range(N_BANKS)) + " | global | max/min ratio |")
         md.append("|---|" + "---|" * (N_BANKS + 2))
-        for s_pb, s_g in (("perbank_flagrate", "global_flagrate"), ("perbank_precision", "global_precision")):
+        for s_pb, s_g in (("perbank_flagrate", "global_flagrate"), ("fullstack_flagrate", "global_flagrate"), ("perbank_precision", "global_precision")):
             cuts = [_mean([t.cutoff for t in _sel(trials, split=mode, bank=k, strategy=s_pb, level="L2")]) for k in range(N_BANKS)]
             gcut = _mean([t.cutoff for t in _sel(trials, split=mode, strategy=s_g, level="L2")])
             ratio = max(cuts) / min(cuts) if min(cuts) > 0 else float("nan")
@@ -286,6 +316,17 @@ Cells: {N_BANKS} banks × {len(seeds)} seeds = {N_BANKS * len(seeds)} per split.
             f"**{_pct(p_rng[0])}-{_pct(p_rng[1])}**. For the same total alert volume, pooled >=L2 recall changes by **{100 * d_recall:+.1f} pts** "
             f"(per-bank minus global). Labelled precision-target calibration meets its >=L2 target in {sum(g_hit)}/{len(g_hit)} bank-cells with the "
             f"global cutoff vs {sum(p_hit)}/{len(p_hit)} per-bank."
+        )
+        fs_rng = ( min(t.flag_rate for t in _sel(trials, split=mode, strategy="fullstack_flagrate", level="L2")),
+                   max(t.flag_rate for t in _sel(trials, split=mode, strategy="fullstack_flagrate", level="L2")) )
+        seeds_ = sorted({t.seed for t in trials})
+        def _pooled_recall(strategy):
+            rows = _sel(trials, split=mode, strategy=strategy, level="L2")
+            return _mean([sum(t.tp for t in rows if t.seed == sd) / max(1, sum(t.n_fraud_eval for t in rows if t.seed == sd)) for sd in seeds_])
+        md.append(
+            f"  Full stack (`fullstack_flagrate`, global + local fine-tune + per-bank cutoff): alert volume "
+            f"**{_pct(fs_rng[0])}-{_pct(fs_rng[1])}**, pooled >=L2 recall {_pct(_pooled_recall('fullstack_flagrate'), 1)} vs "
+            f"{_pct(_pooled_recall('perbank_flagrate'), 1)} for per-bank cutoffs on the shared model and {_pct(_pooled_recall('global_flagrate'), 1)} for the global cutoff."
         )
     md.append("")
     # Cross-split totals so the prose below is computed, not asserted.
@@ -332,5 +373,8 @@ def bridge_summary(trials: list[BridgeTrial], modes: tuple[str, ...]) -> dict:
             "l2_flag_rate_perbank_min": min(p), "l2_flag_rate_perbank_max": max(p),
             "l2_pooled_recall_global": pooled_recall("global_flagrate"),
             "l2_pooled_recall_perbank": pooled_recall("perbank_flagrate"),
+            "l2_pooled_recall_fullstack": pooled_recall("fullstack_flagrate"),
+            "l2_flag_rate_fullstack_min": min(t.flag_rate for t in _sel(trials, split=mode, strategy="fullstack_flagrate", level="L2")),
+            "l2_flag_rate_fullstack_max": max(t.flag_rate for t in _sel(trials, split=mode, strategy="fullstack_flagrate", level="L2")),
         }
     return out
