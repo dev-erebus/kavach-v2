@@ -288,23 +288,30 @@ Cells: {N_BANKS} banks × {len(seeds)} seeds = {N_BANKS * len(seeds)} per split.
             f"global cutoff vs {sum(p_hit)}/{len(p_hit)} per-bank."
         )
     md.append("")
+    # Cross-split totals so the prose below is computed, not asserted.
+    d_recalls = {m: bridge_summary(trials, (m,))[m]["l2_pooled_recall_perbank"] - bridge_summary(trials, (m,))[m]["l2_pooled_recall_global"] for m in modes}
+    g_hits = [t.precision >= PRECISION_TARGETS[1] for t in _sel(trials, strategy="global_precision", level="L2") if not np.isnan(t.precision)]
+    p_hits = [t.precision >= PRECISION_TARGETS[1] for t in _sel(trials, strategy="perbank_precision", level="L2") if not np.isnan(t.precision)]
+    worst = min(d_recalls, key=d_recalls.get)
     md.append(
-        """**What the bridge demonstrably buys, on this data:** *alert-budget adherence per bank.* Under the non-IID splits a
+        f"""**What the bridge demonstrably buys, on this data:** *alert-budget adherence per bank.* Under the non-IID splits a
 single cutoff over-alerts the bank whose score distribution sits highest and starves the others - a 1% budget becomes
 several percent at one bank and a fraction of a percent at another. Per-bank flag-rate calibration removes that, with no
 labels needed.
 
-**What it does not buy here:** *more fraud caught.* For the same total number of alerts, pooled recall is within about a
-point either way. That is expected from the construction: the global model's probabilities are comparable across banks,
-so a single cutoff already allocates alerts to the highest-scoring rows regardless of bank - the recall-optimal allocation
-of a fixed total budget. Per-bank budgets trade a little of that optimality for predictable ops load at every bank. Which
-one a federation wants is a policy decision, not a modelling one, and the bridge supports both.
+**What it does not buy here:** *more fraud caught.* For the same total number of alerts, pooled >=L2 recall under per-bank
+budgets minus recall under the global cutoff is {", ".join(f"{100 * d_recalls[m]:+.1f} pts (`{m}`)" for m in modes)}. Per-bank budgets
+never gain more than {100 * max(d_recalls.values()):+.1f} pts and give up {100 * -d_recalls[worst]:.1f} pts under `{worst}`. That is expected from the construction: the global model's
+probabilities are comparable across banks, so a single cutoff already allocates alerts to the highest-scoring rows regardless
+of bank - the recall-optimal allocation of a fixed total budget. Per-bank budgets trade some of that optimality for predictable
+ops load at every bank. Which one a federation wants is a policy decision, not a modelling one, and the bridge supports both.
 
-**Labelled per-bank precision calibration is fragile at this fraud volume.** With tens of confirmed frauds per bank,
-cutoffs fitted to one half do not hold on the other; the pooled global cutoff generalises better. Precision-target
-calibration should wait until `/feedback` has accumulated hundreds of confirmed outcomes per bank, and the bridge should
-fall back to flag-rate calibration (or the global cutoff) until then. Under `iid` the strategies are, as expected, close
-to indistinguishable - that row is the control.
+**Labelled per-bank precision calibration is unreliable at this fraud volume.** Across all splits the >=L2 precision target
+is met on the evaluation half in {sum(g_hits)}/{len(g_hits)} bank-cells with the global cutoff and {sum(p_hits)}/{len(p_hits)} with per-bank cutoffs, and
+which strategy does better flips by split. With tens of confirmed frauds per bank-half, a cutoff fitted to one half does not
+hold on the other whichever way it is fitted. Precision-target calibration should wait until `/feedback` has accumulated
+hundreds of confirmed outcomes per bank; until then the bridge should run on flag-rate calibration. Under `iid` the flag-rate
+strategies are, as expected, indistinguishable - that row is the control.
 """
     )
     return "\n".join(md)
