@@ -458,6 +458,20 @@ as a property of the federated-learning machinery, not of Kavach's fraud detecti
             f"wins {wmax}/{tmax}. Federation captures {100 * (f0 - l0) / (p0 - l0) if p0 > l0 else float('nan'):.0f}% of the pooled-vs-local gap at cold start."
         )
     md.append("")
+    md.append("**FedAvg vs coordinate-median with no attacker** (the efficiency price of robustness, if any):\n")
+    for mode in modes:
+        rows = []
+        for n in HISTORY_SIZES:
+            f, m = _agg(trials, mode, n, "fedavg")[0], _agg(trials, mode, n, "coord_median")[0]
+            w, t = _wins(trials, mode, n, "coord_median", "fedavg")
+            rows.append(f"n={n}: {m - f:+.3f} (median wins {w}/{t})")
+        md.append(f"- `{mode}`: " + "; ".join(rows))
+    md.append(
+        "\nA negative number is the cost of using the median when everyone is honest; a positive one means the "
+        "median generalised *better* to the held-out bank — which happens when partitions are skewed enough that the "
+        "sample-weighted mean is dominated by whichever contributor is largest or most atypical."
+    )
+    md.append("")
 
     if pt:
         md.append("## Result 2 — poisoned deltas (§5.4)\n")
@@ -522,9 +536,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--poison-mode", default="amount")
     ap.add_argument("--no-poison", action="store_true")
     ap.add_argument("--quick", action="store_true", help="1 seed, iid+amount only")
+    ap.add_argument("--from-json", type=Path, default=None, help="re-render the report from a saved trials JSON instead of re-running")
     args = ap.parse_args(argv)
     if args.quick:
         args.seeds, args.modes = 1, ["iid", "amount"]
+
+    if args.from_json is not None:
+        raw = json.loads(args.from_json.read_text(encoding="utf-8"))
+        trials = [Trial(**t) for t in raw["trials"]]
+        pt = [PoisonTrial(**p) for p in raw["poisoning"]]
+        modes = tuple(dict.fromkeys(t.split for t in trials))
+        seeds = tuple(sorted({t.seed for t in trials}))
+        ds = load_ulb()
+        X = ulb_features(ds.frame[ds.feature_columns].to_numpy(), ds.frame["amount"].to_numpy())
+        y = ds.frame["label"].to_numpy().astype(int)
+        amount = ds.frame["amount"].to_numpy(dtype=float)
+        splits = {m: make_split(m, X, amount, y, np.random.default_rng(seeds[0])) for m in modes}
+        path = render_report(trials, splits, pt, modes, seeds, ExpConfig(), len(y), float(y.mean()), args.out, raw.get("elapsed_s", 0.0))
+        print(f"[fed] re-rendered -> {path}")
+        return 0
 
     t0 = time.time()
     print("[fed] loading ULB ...", flush=True)
@@ -546,7 +576,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     elapsed = time.time() - t0
     path = render_report(trials, splits, pt, modes, seeds, cfg, len(y), float(y.mean()), args.out, elapsed)
     (args.out / "cold_start_trials.json").write_text(
-        json.dumps({"trials": [asdict(t) for t in trials], "poisoning": [asdict(p) for p in pt]}, indent=1), encoding="utf-8"
+        json.dumps({"trials": [asdict(t) for t in trials], "poisoning": [asdict(p) for p in pt], "elapsed_s": elapsed}, indent=1), encoding="utf-8"
     )
     print(f"[fed] report -> {path} ({elapsed / 60:.1f} min)")
     for mode in modes:
