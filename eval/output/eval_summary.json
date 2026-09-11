@@ -1,0 +1,67 @@
+{
+  "dataset": "ulb",
+  "n": 282982,
+  "n_fraud": 465,
+  "prevalence": 0.0016432140560176973,
+  "rejected": {
+    "schema_violation: amount_inr: Value error, amount_inr must be > 0": 1825
+  },
+  "auc_pr": 0.0018164896260781974,
+  "auc_roc": 0.5350966109908849,
+  "points": {
+    "L1": {
+      "precision": 0.002258113900796081,
+      "recall": 0.2537634408602151,
+      "f1": 0.004476394605565146,
+      "flag_rate": 0.1846619219597006,
+      "tp": 118,
+      "fp": 52138,
+      "fn": 347,
+      "tn": 230379
+    },
+    "L2": {
+      "precision": 0.0032599837000814994,
+      "recall": 0.017204301075268817,
+      "f1": 0.005481329222336416,
+      "flag_rate": 0.008671929663370815,
+      "tp": 8,
+      "fp": 2446,
+      "fn": 457,
+      "tn": 280071
+    },
+    "L3": {
+      "precision": NaN,
+      "recall": 0.0,
+      "f1": 0.0,
+      "flag_rate": 0.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 465,
+      "tn": 282517
+    }
+  },
+  "rule_attribution": {
+    "L0_default": {
+      "n": 230726,
+      "fraud": 347,
+      "legit": 230379
+    },
+    "L1_low_amount": {
+      "n": 49802,
+      "fraud": 110,
+      "legit": 49692
+    },
+    "L2_high_amount_alone": {
+      "n": 2454,
+      "fraud": 8,
+      "legit": 2446
+    }
+  },
+  "baseline": {
+    "name": "logistic regression on V1..V28 + log(amount)",
+    "auc_pr": 0.7596169020333872,
+    "auc_roc": 0.9880759668624692,
+    "rules_on_same_split_auc_pr": 0.0017046649997373006
+  },
+  "domain_caveat": "card-present/e-commerce fraud dataset; validates pipeline mechanics only, NOT UPI/IMPS social-engineering detection"
+}
