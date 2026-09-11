@@ -4,3 +4,5 @@ __pycache__/
 data/
 *.egg-info/
 .venv/
+federated/output_quick/
+federated/output_full_run.log
