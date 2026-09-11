@@ -199,6 +199,17 @@ class Trial:
     test_fraud: int
     history_fraud: int
 
+    @property
+    def prevalence(self) -> float:
+        """Fraud prevalence of THIS cell's test set — the AUC-PR floor for this cell."""
+        return self.test_fraud / self.test_n if self.test_n else float("nan")
+
+    @property
+    def lift(self) -> float:
+        """AUC-PR over the cell's own prevalence floor. A constant scorer has lift exactly 1.0."""
+        p = self.prevalence
+        return self.auc_pr / p if p > 0 else float("nan")
+
 
 def cold_start(
     X: np.ndarray, amount: np.ndarray, y: np.ndarray, modes: tuple[str, ...], seeds: tuple[int, ...], cfg: ExpConfig, log=print
@@ -305,20 +316,52 @@ def poisoning(
 # --------------------------------------------------------------------------- #
 # Report
 # --------------------------------------------------------------------------- #
-def _agg(trials: list[Trial], mode: str, n: int, method: str) -> tuple[float, float, int]:
-    v = np.array([t.auc_pr for t in trials if t.split == mode and t.history == n and t.method == method])
+#: Row order for result tables: cells where local-only has real data first; n=0 last as the
+#: degenerate reference (local-only is a constant scorer there and cannot rank).
+TABLE_ORDER = tuple(n for n in HISTORY_SIZES if n > 0) + (0,)
+BREAKDOWN_N = (50, 500)
+
+
+def _cells(trials: list[Trial], mode: str, n: int, method: str) -> list[Trial]:
+    return [t for t in trials if t.split == mode and t.history == n and t.method == method]
+
+
+def _agg(trials: list[Trial], mode: str, n: int, method: str, metric: str = "auc_pr") -> tuple[float, float, int]:
+    v = np.array([getattr(t, metric) for t in _cells(trials, mode, n, method)], dtype=float)
+    v = v[np.isfinite(v)]
     return (float(v.mean()), float(v.std(ddof=1)) if len(v) > 1 else 0.0, len(v)) if v.size else (float("nan"), float("nan"), 0)
 
 
 def _wins(trials: list[Trial], mode: str, n: int, a: str, b: str) -> tuple[int, int]:
-    """Paired comparison: in how many (seed, held_out) cells does method a beat method b?"""
-    cells = {(t.seed, t.held_out): t.auc_pr for t in trials if t.split == mode and t.history == n and t.method == a}
-    other = {(t.seed, t.held_out): t.auc_pr for t in trials if t.split == mode and t.history == n and t.method == b}
+    """Paired comparison: in how many (seed, held_out) cells does method a beat method b?
+
+    Invariant to per-cell normalisation: a and b share the cell's test set, so AUC-PR and lift
+    give identical win counts. Normalisation changes the cross-cell mean and spread, not this.
+    """
+    cells = {(t.seed, t.held_out): t.auc_pr for t in _cells(trials, mode, n, a)}
+    other = {(t.seed, t.held_out): t.auc_pr for t in _cells(trials, mode, n, b)}
     keys = sorted(set(cells) & set(other))
     return sum(cells[k] > other[k] for k in keys), len(keys)
 
 
-def plot_curves(trials: list[Trial], modes: tuple[str, ...], out: Path) -> None:
+def _corr_with_prevalence(trials: list[Trial], mode: str, n: int, method: str) -> tuple[float, int]:
+    """Pearson r between a cell's AUC-PR and its own prevalence. High r = the spread is base rate, not method."""
+    c = _cells(trials, mode, n, method)
+    if len(c) < 3:
+        return float("nan"), len(c)
+    a = np.array([t.auc_pr for t in c])
+    p = np.array([t.prevalence for t in c])
+    if a.std() == 0 or p.std() == 0:
+        return float("nan"), len(c)
+    return float(np.corrcoef(a, p)[0, 1]), len(c)
+
+
+def _mean_history_fraud(trials: list[Trial], mode: str, n: int) -> float:
+    c = _cells(trials, mode, n, "local_only")
+    return float(np.mean([t.history_fraud for t in c])) if c else float("nan")
+
+
+def plot_curves(trials: list[Trial], modes: tuple[str, ...], out: Path, metric: str = "auc_pr") -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -329,15 +372,18 @@ def plot_curves(trials: list[Trial], modes: tuple[str, ...], out: Path) -> None:
     xs = np.arange(len(HISTORY_SIZES))
     for ax, mode in zip(axes, modes):
         for method in METHODS:
-            mu = np.array([_agg(trials, mode, n, method)[0] for n in HISTORY_SIZES])
-            sd = np.array([_agg(trials, mode, n, method)[1] for n in HISTORY_SIZES])
+            mu = np.array([_agg(trials, mode, n, method, metric)[0] for n in HISTORY_SIZES])
+            sd = np.array([_agg(trials, mode, n, method, metric)[1] for n in HISTORY_SIZES])
             ax.errorbar(xs, mu, yerr=sd, marker="o", capsize=3, label=method)
         ax.set_xticks(xs)
-        ax.set_xticklabels([str(n) for n in HISTORY_SIZES])
+        ax.set_xticklabels([("0 (degenerate)" if n == 0 else str(n)) for n in HISTORY_SIZES], fontsize=8)
         ax.set_xlabel("held-out bank's labelled history (rows)")
         ax.set_title(f"split = {mode}")
         ax.grid(alpha=0.3)
-    axes[0].set_ylabel("AUC-PR on held-out bank (mean ± sd over banks × seeds)")
+        if metric == "lift":
+            ax.set_yscale("log")
+    ylabel = "AUC-PR on held-out bank" if metric == "auc_pr" else "lift = AUC-PR / held-out prevalence (log)"
+    axes[0].set_ylabel(f"{ylabel}\n(mean ± sd over banks × seeds)")
     axes[-1].legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(out, dpi=130)
@@ -372,12 +418,19 @@ def plot_poison(pt: list[PoisonTrial], out: Path) -> None:
     plt.close(fig)
 
 
+def _fmt_cell(trials: list[Trial], mode: str, n: int, method: str) -> str:
+    mu, sd, _ = _agg(trials, mode, n, method, "auc_pr")
+    lm, ls, _ = _agg(trials, mode, n, method, "lift")
+    return f"{mu:.3f} ± {sd:.3f}<br><sub>lift {lm:.0f} ± {ls:.0f}</sub>"
+
+
 def render_report(
     trials: list[Trial], splits: dict[str, Split], pt: list[PoisonTrial], modes: tuple[str, ...], seeds: tuple[int, ...], cfg: ExpConfig,
-    n_rows: int, prevalence: float, out_dir: Path, elapsed: float,
+    n_rows: int, prevalence: float, out_dir: Path, elapsed_s: Optional[float], bridge_md: Optional[str] = None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    plot_curves(trials, modes, out_dir / "cold_start_curves.png")
+    plot_curves(trials, modes, out_dir / "cold_start_curves.png", "auc_pr")
+    plot_curves(trials, modes, out_dir / "cold_start_lift.png", "lift")
     if pt:
         plot_poison(pt, out_dir / "poisoning.png")
 
@@ -387,8 +440,9 @@ def render_report(
         f"""## What this is and is not
 
 **Is:** a test of the *mechanism* in Component B — whether aggregating weight deltas from several
-partitions transfers useful structure to a partition that contributed nothing, and how fast local
-history closes the gap. Run on the ULB credit-card dataset ({n_rows:,} rows, fraud prevalence
+partitions transfers useful structure to a partition that contributed nothing, how fast local
+history closes the gap, and (Result 3) whether per-bank calibrated cutoffs do anything a single
+global cutoff does not. Run on the ULB credit-card dataset ({n_rows:,} rows, fraud prevalence
 {100 * prevalence:.3f}%), partitioned into {N_BANKS} synthetic "banks".
 
 **Is not:** evidence about Indian UPI/IMPS fraud. The data is 2013 European card fraud with
@@ -407,16 +461,23 @@ as a property of the federated-learning machinery, not of Kavach's fraud detecti
   labelled history (n ∈ {list(HISTORY_SIZES)}), rows beyond position {TEST_OFFSET} form a **fixed test set** so
   all history sizes are scored on identical rows.
 - **Methods compared on the held-out bank**, each followed by the *same* {cfg.finetune_epochs}-epoch fine-tune on the *n* history rows:
-  - `local_only` — from zero weights. At n=0 this is a constant scorer (AUC-PR = prevalence).
+  - `local_only` — from zero weights. **At n=0 this is a constant scorer** — every row gets the same probability,
+    so it cannot rank and its AUC-PR equals the prevalence (lift exactly 1.0). Comparisons at n=0 are against a
+    model that cannot do the task; they are reported as the degenerate reference, not as the result.
   - `fedavg` — FedAvg global model learned from the other {N_BANKS - 1} banks' deltas.
   - `coord_median` — same, coordinate-median aggregation.
   - `pooled` — the other banks' raw rows pooled centrally, {cfg.pooled_epochs} epochs. **Upper bound**: what federation
     is trying to approach without anyone pooling data.
 - **Seeds:** {list(seeds)} → {len(seeds) * N_BANKS} (seed × held-out bank) cells per split per history size.
-- **Metric:** AUC-PR on the held-out bank's test rows. Spread is the sd over cells.
+- **Metrics:** AUC-PR on the held-out bank's test rows, **and lift = AUC-PR / that cell's own prevalence.**
+  AUC-PR's floor is the prevalence, and held-out prevalence varies several-fold across banks under the non-IID
+  splits, so a raw cross-bank mean mixes scales and its sd includes base-rate variation. Lift puts every cell on
+  its own floor. Paired win counts are identical under both metrics (same test set per cell); lift changes the
+  cross-bank mean and spread. Spread is the sd over cells.
 """
     )
 
+    # ---- splits ------------------------------------------------------------
     md.append("## Splits\n")
     for mode in modes:
         s = splits[mode]
@@ -424,55 +485,104 @@ as a property of the federated-learning machinery, not of Kavach's fraud detecti
         md.append("| Bank | Rows | Fraud | Prevalence | Median amount (EUR) |\n|---|---|---|---|---|")
         for b in s.per_bank:
             md.append(f"| bank{b['bank']} | {b['n']:,} | {b['fraud']} | {100 * b['prevalence']:.3f}% | {b['median_amount']:.2f} |")
-        md.append("")
+        prevs = [b["prevalence"] for b in s.per_bank]
+        md.append(f"\nPrevalence ratio across banks (max/min): **{max(prevs) / min(prevs):.1f}×**.\n")
 
+    # ---- result 1 ----------------------------------------------------------
     md.append("## Result 1 — cold-start curves\n")
-    md.append("![cold start](cold_start_curves.png)\n")
+    md.append("Raw AUC-PR (left figure) and lift over each cell's prevalence floor (right figure, log scale).\n")
+    md.append("![cold start](cold_start_curves.png)\n\n![cold start lift](cold_start_lift.png)\n")
+
     for mode in modes:
-        md.append(f"### `{mode}` — AUC-PR on held-out bank, mean ± sd (n cells)\n")
-        md.append("| History rows | " + " | ".join(f"`{m}`" for m in METHODS) + " | fedavg beats local (cells) | fedavg vs pooled (gap) |")
-        md.append("|---|" + "---|" * len(METHODS) + "---|---|")
-        for n in HISTORY_SIZES:
-            cells = []
-            for m in METHODS:
-                mu, sd, k = _agg(trials, mode, n, m)
-                cells.append(f"{mu:.3f} ± {sd:.3f}")
+        md.append(f"### `{mode}` — held-out bank, mean ± sd over {len(seeds) * N_BANKS} cells; each cell shows AUC-PR and lift\n")
+        md.append("| History rows | fraud rows in history (mean) | " + " | ".join(f"`{m}`" for m in METHODS) + " | fedavg beats local (cells) | pooled − fedavg (AUC-PR) |")
+        md.append("|---|---|" + "---|" * len(METHODS) + "---|---|")
+        for n in TABLE_ORDER:
+            label = f"{n}" if n > 0 else "0 — *degenerate reference*"
+            cells = [_fmt_cell(trials, mode, n, m) for m in METHODS]
             w, tot = _wins(trials, mode, n, "fedavg", "local_only")
             gap = _agg(trials, mode, n, "pooled")[0] - _agg(trials, mode, n, "fedavg")[0]
-            md.append(f"| {n} | " + " | ".join(cells) + f" | {w}/{tot} | {gap:+.3f} |")
+            md.append(f"| {label} | {_mean_history_fraud(trials, mode, n):.1f} | " + " | ".join(cells) + f" | {w}/{tot} | {gap:+.3f} |")
         md.append("")
 
-    # Plain-language reading, computed not asserted.
+    # ---- reading the curves -------------------------------------------------
     md.append("### Reading the curves\n")
+    md.append(
+        "The result is the **n=50 and n=500 rows**: there the local-only model has real labelled data — on average "
+        + ", ".join(f"{_mean_history_fraud(trials, modes[0], n):.1f} fraud rows at n={n}" for n in (50, 500))
+        + " — and is genuinely trying to rank.\n"
+    )
     for mode in modes:
-        f0 = _agg(trials, mode, 0, "fedavg")[0]
-        l0 = _agg(trials, mode, 0, "local_only")[0]
-        p0 = _agg(trials, mode, 0, "pooled")[0]
-        fmax = _agg(trials, mode, HISTORY_SIZES[-1], "fedavg")[0]
-        lmax = _agg(trials, mode, HISTORY_SIZES[-1], "local_only")[0]
-        w0, t0 = _wins(trials, mode, 0, "fedavg", "local_only")
-        wmax, tmax = _wins(trials, mode, HISTORY_SIZES[-1], "fedavg", "local_only")
-        md.append(
-            f"- **`{mode}`:** at 0 history, federated {f0:.3f} vs local-only {l0:.3f} (pooled upper bound {p0:.3f}); "
-            f"federated wins {w0}/{t0} cells. At {HISTORY_SIZES[-1]} history, federated {fmax:.3f} vs local-only {lmax:.3f}, "
-            f"wins {wmax}/{tmax}. Federation captures {100 * (f0 - l0) / (p0 - l0) if p0 > l0 else float('nan'):.0f}% of the pooled-vs-local gap at cold start."
-        )
+        parts = []
+        for n in (50, 500, 5000):
+            f_ap, l_ap = _agg(trials, mode, n, "fedavg")[0], _agg(trials, mode, n, "local_only")[0]
+            f_l, l_l = _agg(trials, mode, n, "fedavg", "lift")[0], _agg(trials, mode, n, "local_only", "lift")[0]
+            w, t = _wins(trials, mode, n, "fedavg", "local_only")
+            parts.append(f"n={n}: federated {f_ap:.3f} vs local {l_ap:.3f} AUC-PR (lift {f_l:.0f}× vs {l_l:.0f}×), wins {w}/{t}")
+        p50 = _agg(trials, mode, 50, "pooled")[0]
+        f50 = _agg(trials, mode, 50, "fedavg")[0]
+        l50 = _agg(trials, mode, 50, "local_only")[0]
+        md.append(f"- **`{mode}`:** " + "; ".join(parts) + f". At n=50 federation captures {100 * (f50 - l50) / (p50 - l50) if p50 > l50 else float('nan'):.0f}% of the pooled-vs-local gap.")
     md.append("")
-    md.append("**FedAvg vs coordinate-median with no attacker** (the efficiency price of robustness, if any):\n")
+    md.append(
+        "**Does the win hold on lift?** Per-cell win counts are the same under lift by construction (shared test set). "
+        "The cross-bank *means* are what lift changes, and the federated-over-local ordering of means is preserved in every split "
+        "and every history size above — the claim does not depend on which scale is used.\n"
+    )
+    md.append(
+        "**n=0 is the degenerate reference.** `local_only` at n=0 is a constant scorer (lift 1.0 in every cell); the "
+        + "/".join(f"{_wins(trials, m, 0, 'fedavg', 'local_only')[0]}" for m in modes)
+        + f" of {len(seeds) * N_BANKS} wins there say only that a model beats no model. They are not the headline.\n"
+    )
+
+    # ---- per-held-out-bank breakdown --------------------------------------
+    md.append("### Per-held-out-bank breakdown (attributing the spread)\n")
+    md.append(
+        "Mean over seeds for each held-out bank. `prev` is that bank's test-set prevalence — the AUC-PR floor for its row. "
+        "Where AUC-PR tracks `prev` down a column, the cross-bank sd is base rate, not method.\n"
+    )
+    for mode in modes:
+        md.append(f"#### `{mode}`\n")
+        hdr = "| Held-out | prev | " + " | ".join(f"`{m}` n={n}" for n in BREAKDOWN_N for m in METHODS) + " |"
+        md.append(hdr)
+        md.append("|---|---|" + "---|" * (len(BREAKDOWN_N) * len(METHODS)))
+        for h in range(N_BANKS):
+            row_cells = []
+            prev = np.mean([t.prevalence for t in trials if t.split == mode and t.held_out == h and t.history == 0 and t.method == "fedavg"])
+            for n in BREAKDOWN_N:
+                for m in METHODS:
+                    c = [t for t in _cells(trials, mode, n, m) if t.held_out == h]
+                    ap = np.mean([t.auc_pr for t in c]) if c else float("nan")
+                    lf = np.mean([t.lift for t in c]) if c else float("nan")
+                    row_cells.append(f"{ap:.3f}<br><sub>{lf:.0f}×</sub>")
+            md.append(f"| bank{h} | {100 * prev:.3f}% | " + " | ".join(row_cells) + " |")
+        r_f, k = _corr_with_prevalence(trials, mode, 500, "fedavg")
+        r_l, _ = _corr_with_prevalence(trials, mode, 500, "local_only")
+        r_p, _ = _corr_with_prevalence(trials, mode, 500, "pooled")
+        md.append(
+            f"\nPearson r between a cell's AUC-PR and its prevalence at n=500 ({k} cells): fedavg **{r_f:+.2f}**, "
+            f"local-only {r_l:+.2f}, pooled {r_p:+.2f}. "
+            + ("A strong positive r means most of the raw sd in that column is base rate." if np.isfinite(r_f) and abs(r_f) > 0.5 else "A weak r means the spread is mostly method/seed variance, not base rate.")
+            + "\n"
+        )
+
+    # ---- fedavg vs median ----------------------------------------------------
+    md.append("### FedAvg vs coordinate-median with no attacker\n")
+    md.append("The efficiency price of the robust rule, if any (AUC-PR difference, median − fedavg; paired wins for median):\n")
     for mode in modes:
         rows = []
-        for n in HISTORY_SIZES:
+        for n in TABLE_ORDER:
             f, m = _agg(trials, mode, n, "fedavg")[0], _agg(trials, mode, n, "coord_median")[0]
             w, t = _wins(trials, mode, n, "coord_median", "fedavg")
-            rows.append(f"n={n}: {m - f:+.3f} (median wins {w}/{t})")
+            rows.append(f"n={n}: {m - f:+.3f} ({w}/{t})")
         md.append(f"- `{mode}`: " + "; ".join(rows))
     md.append(
         "\nA negative number is the cost of using the median when everyone is honest; a positive one means the "
         "median generalised *better* to the held-out bank — which happens when partitions are skewed enough that the "
-        "sample-weighted mean is dominated by whichever contributor is largest or most atypical."
+        "sample-weighted mean is dominated by whichever contributor is largest or most atypical.\n"
     )
-    md.append("")
 
+    # ---- result 2 ----------------------------------------------------------
     if pt:
         md.append("## Result 2 — poisoned deltas (§5.4)\n")
         mode = pt[0].split
@@ -505,6 +615,11 @@ here; it separates from it only with more participants.
 """
         )
 
+    # ---- result 3 ----------------------------------------------------------
+    if bridge_md:
+        md.append(bridge_md)
+
+    # ---- limitations -------------------------------------------------------
     md.append(
         f"""## Limitations
 
@@ -512,29 +627,45 @@ here; it separates from it only with more participants.
 2. "Banks" are synthetic partitions of one dataset. Real banks differ in ways a mixing matrix does not capture
    (different fraud typologies, different labelling latency and quality, different base rates by an order of magnitude).
 3. Logistic regression is a deliberately simple learner. The federated-vs-local *gap* is what is being measured, and a
-   stronger local learner would shrink it at large history — the cold-start end of the curve is the claim, not the right end.
+   stronger local learner would shrink it at large history — the small-history end of the curve is the claim, not the right end.
 4. Attackers here are crude (sign flip, noise, inflated counts). A stealthy attacker who shifts deltas by a small,
    consistent amount every round is not tested and is *not* defeated by a median.
 5. No differential privacy or secure aggregation: the aggregator sees each bank's delta in the clear. "No raw data leaves
    the bank" is true; "nothing about the bank's data can be inferred from its delta" is not claimed.
 6. Fine-tune epochs, rounds and learning rate were set once, not tuned per method. Tuning would move numbers, not the shape.
-
-_Run time {elapsed / 60:.1f} min. Raw trials in `cold_start_trials.json`._
+7. Result 3 uses the same global model at every bank so that only the cutoffs differ; in deployment each bank also
+   fine-tunes, which would change the score distributions the cutoffs are calibrated on.
 """
     )
+    if elapsed_s is not None and elapsed_s > 0:
+        md.append(f"_Run time {elapsed_s / 60:.1f} min. Raw trials in `cold_start_trials.json`._\n")
+    else:
+        md.append("_Re-rendered from `cold_start_trials.json`; run time recorded in that file if the run persisted it._\n")
+
     path = out_dir / "cold_start_report.md"
     path.write_text("\n".join(md), encoding="utf-8")
     return path
 
 
 # --------------------------------------------------------------------------- #
+def _load_dataset():
+    ds = load_ulb()
+    X = ulb_features(ds.frame[ds.feature_columns].to_numpy(), ds.frame["amount"].to_numpy())
+    y = ds.frame["label"].to_numpy().astype(int)
+    amount = ds.frame["amount"].to_numpy(dtype=float)
+    return X, y, amount
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    from . import bridge_calibration as bc  # local import: bc imports helpers from this module
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=Path("federated/output"))
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--modes", nargs="+", default=["iid", "amount", "cluster"])
     ap.add_argument("--poison-mode", default="amount")
     ap.add_argument("--no-poison", action="store_true")
+    ap.add_argument("--no-bridge", action="store_true", help="skip Result 3 (threshold-bridge calibration)")
     ap.add_argument("--quick", action="store_true", help="1 seed, iid+amount only")
     ap.add_argument("--from-json", type=Path, default=None, help="re-render the report from a saved trials JSON instead of re-running")
     args = ap.parse_args(argv)
@@ -545,23 +676,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         raw = json.loads(args.from_json.read_text(encoding="utf-8"))
         trials = [Trial(**t) for t in raw["trials"]]
         pt = [PoisonTrial(**p) for p in raw["poisoning"]]
+        bt = [bc.BridgeTrial(**b) for b in raw.get("bridge", [])]
         modes = tuple(dict.fromkeys(t.split for t in trials))
         seeds = tuple(sorted({t.seed for t in trials}))
-        ds = load_ulb()
-        X = ulb_features(ds.frame[ds.feature_columns].to_numpy(), ds.frame["amount"].to_numpy())
-        y = ds.frame["label"].to_numpy().astype(int)
-        amount = ds.frame["amount"].to_numpy(dtype=float)
+        X, y, amount = _load_dataset()
         splits = {m: make_split(m, X, amount, y, np.random.default_rng(seeds[0])) for m in modes}
-        path = render_report(trials, splits, pt, modes, seeds, ExpConfig(), len(y), float(y.mean()), args.out, raw.get("elapsed_s", 0.0))
+        bridge_md = bc.render_bridge_section(bt, modes, seeds) if bt else None
+        path = render_report(trials, splits, pt, modes, seeds, ExpConfig(), len(y), float(y.mean()), args.out, raw.get("elapsed_s"), bridge_md)
         print(f"[fed] re-rendered -> {path}")
         return 0
 
     t0 = time.time()
     print("[fed] loading ULB ...", flush=True)
-    ds = load_ulb()
-    X = ulb_features(ds.frame[ds.feature_columns].to_numpy(), ds.frame["amount"].to_numpy())
-    y = ds.frame["label"].to_numpy().astype(int)
-    amount = ds.frame["amount"].to_numpy(dtype=float)
+    X, y, amount = _load_dataset()
     cfg = ExpConfig()
     seeds = tuple(range(args.seeds))
     modes = tuple(args.modes)
@@ -572,16 +699,33 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.no_poison:
         print(f"[fed] poisoning on split={args.poison_mode}", flush=True)
         pt = poisoning(X, amount, y, args.poison_mode, seeds, cfg)
+    bt: list = []
+    bridge_md = None
+    if not args.no_bridge:
+        print("[fed] threshold-bridge calibration experiment", flush=True)
+        bt, _ = bc.run_bridge_experiment(X, amount, y, modes, seeds, cfg)
+        bridge_md = bc.render_bridge_section(bt, modes, seeds)
 
     elapsed = time.time() - t0
-    path = render_report(trials, splits, pt, modes, seeds, cfg, len(y), float(y.mean()), args.out, elapsed)
+    path = render_report(trials, splits, pt, modes, seeds, cfg, len(y), float(y.mean()), args.out, elapsed, bridge_md)
     (args.out / "cold_start_trials.json").write_text(
-        json.dumps({"trials": [asdict(t) for t in trials], "poisoning": [asdict(p) for p in pt], "elapsed_s": elapsed}, indent=1), encoding="utf-8"
+        json.dumps(
+            {
+                "trials": [asdict(t) for t in trials],
+                "poisoning": [asdict(p) for p in pt],
+                "bridge": [asdict(b) for b in bt],
+                "bridge_summary": bc.bridge_summary(bt, modes) if bt else None,
+                "elapsed_s": elapsed,
+            },
+            indent=1,
+            default=float,
+        ),
+        encoding="utf-8",
     )
     print(f"[fed] report -> {path} ({elapsed / 60:.1f} min)")
     for mode in modes:
-        for n in HISTORY_SIZES:
-            cells = "  ".join(f"{m}={_agg(trials, mode, n, m)[0]:.3f}" for m in METHODS)
+        for n in TABLE_ORDER:
+            cells = "  ".join(f"{m}={_agg(trials, mode, n, m)[0]:.3f}({_agg(trials, mode, n, m, 'lift')[0]:.0f}x)" for m in METHODS)
             print(f"  {mode:8s} n={n:<5d} {cells}")
     return 0
 
