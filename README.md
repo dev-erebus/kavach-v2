@@ -301,6 +301,7 @@ MIT — see [LICENSE](LICENSE). If you use this work, cite it via [CITATION.cff]
 
 ```bibtex
 @software{kavach_v2_2026,
+  author  = {Dubey, Ayushmann},
   title   = {Kavach v2: a bank-agnostic, federated, threat-resilient fraud intelligence layer},
   year    = {2026},
   version = {2.0.0},

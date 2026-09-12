@@ -18,8 +18,8 @@ abstract: >-
   coordinate-median holds (0.691); per-bank calibrated thresholds deliver
   alert-budget adherence but not additional detection.
 authors:
-  # TODO(owner): replace with your name, ORCID and affiliation before publishing.
-  - name: "Kavach v2 contributors"
+  - family-names: Dubey
+    given-names: Ayushmann
 repository-code: "https://github.com/dev-erebus/kavach-v2"
 url: "https://github.com/dev-erebus/kavach-v2"
 version: "2.0.0"
