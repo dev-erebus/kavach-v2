@@ -1,6 +1,31 @@
-pydantic>=2.5
-numpy>=1.26
-pandas>=2.0
-scikit-learn>=1.3
-matplotlib>=3.7
-pytest>=7
+# Pinned to the exact versions the reported results were produced with (Python 3.12, Windows 11).
+# Reproducibility claims die on unpinned numpy. Loosen deliberately, then re-run the experiments.
+
+# Direct dependencies
+pydantic==2.13.5
+numpy==2.5.3
+pandas==3.0.5
+scikit-learn==1.9.1
+matplotlib==3.11.1
+pytest==9.1.1
+
+# Transitive dependencies, pinned for a fully reproducible environment
+annotated-types==0.8.0
+contourpy==1.3.3
+cycler==0.12.1
+fonttools==4.65.0
+iniconfig==2.3.0
+joblib==1.6.0
+kiwisolver==1.5.1
+packaging==26.3
+pillow==12.3.0
+pluggy==1.6.0
+pydantic_core==2.46.5
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+scipy==1.18.1
+six==1.17.0
+threadpoolctl==3.6.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+tzdata==2026.3
