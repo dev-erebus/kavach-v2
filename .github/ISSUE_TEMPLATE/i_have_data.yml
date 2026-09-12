@@ -1,0 +1,78 @@
+name: I have data / I want to run Tier 2 on real transactions
+description: You hold labelled transaction data (ideally UPI/IMPS with confirmed outcomes) and want to run the evaluation harness or the federated experiments on it.
+title: "[data] "
+labels: ["tier-2", "dataset"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the contribution that matters most. Every result in this repo is on European card-present fraud;
+        running the same harness on domain-appropriate data is what would turn it from a mechanics check into evidence.
+
+        **You do not need to share the data.** The harness runs locally and writes markdown reports. Sharing the
+        *reports* (with any bank identifiers removed) is the contribution. Please do not paste transaction rows here.
+  - type: dropdown
+    id: domain
+    attributes:
+      label: What kind of transactions
+      options:
+        - UPI / IMPS / NEFT retail transfers (India)
+        - Other real-time payments (non-India)
+        - Card transactions
+        - Synthetic / simulated (please say how it was generated)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: labels
+    attributes:
+      label: How are outcomes labelled?
+      description: Confirmed fraud via customer complaint / chargeback / investigation? Labelling latency? Approximate prevalence? Any known label noise?
+    validations:
+      required: true
+  - type: checkboxes
+    id: fields
+    attributes:
+      label: Which canonical fields does your data actually contain?
+      description: Tick only what exists as a real signal. Missing fields are filled neutrally by the harness and disclosed in the report.
+      options:
+        - label: amount
+        - label: sender_age
+        - label: receiver_account_age_days
+        - label: is_active_phone_call (device-side signal at initiation)
+        - label: caller_verified_biometric (voice-liveness verdict)
+        - label: is_new_beneficiary
+        - label: device_location / remarks / receiver_name (free text)
+        - label: a natural partition into ≥3 "banks" / regions / channels (needed for the federated experiments)
+  - type: input
+    id: size
+    attributes:
+      label: Approximate size
+      placeholder: "e.g. 1.2M rows, ~900 confirmed fraud, 14 months"
+    validations:
+      required: true
+  - type: dropdown
+    id: what
+    attributes:
+      label: What do you want to run?
+      options:
+        - Pipeline evaluation only (python -m eval.run_eval)
+        - Federated cold-start / poisoning / bridge experiments (needs ≥3 partitions)
+        - Both
+        - Not sure — help me decide
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Can the data leave your environment? Can you share reports? Any legal / DPDP / residency constraints we should design around?
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: I have read the "Results" caveats in README.md and understand the harness validates pipeline mechanics; detection claims require domain-appropriate labels.
+          required: true
+        - label: I will not paste raw transaction rows or personal data into this issue.
+          required: true

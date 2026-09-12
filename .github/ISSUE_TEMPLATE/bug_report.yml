@@ -1,0 +1,62 @@
+name: Bug report
+description: Something is wrong in the code, a test, or a generated report.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. Two things make a bug report actionable here: the exact command, and whether `pytest -q` passes on your machine.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - adapters / schema / feature contract
+        - eval harness or report
+        - federated (learner, aggregator, model store, threshold bridge, feedback)
+        - experiments (cold_start / bridge_calibration)
+        - hardening (sanitizer, adversarial corpus, voice-liveness interface)
+        - compliance (FR-2 template)
+        - docs / README / RESULTS
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got. Paste the traceback if there is one.
+      placeholder: |
+        python -m eval.run_eval --dataset ulb
+        ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest command or snippet that shows it. If it is a wrong number in a report, name the table and the cell.
+    validations:
+      required: true
+  - type: input
+    id: pytest
+    attributes:
+      label: Does `pytest -q` pass?
+      placeholder: "e.g. 145 passed / 2 failed (paste the failing test ids)"
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "Python 3.12.7, Windows 11, requirements.txt pinned versions (or list any deviation)"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: I installed from the pinned `requirements.txt` (or listed my deviations above).
+          required: true
+        - label: If this is about a result, I re-ran the experiment rather than reading a stale `output/` file.

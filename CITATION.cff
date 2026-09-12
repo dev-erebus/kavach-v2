@@ -1,0 +1,83 @@
+# This CITATION.cff file was generated for Kavach v2.
+# Validate with: pip install cffconvert && cffconvert --validate
+cff-version: 1.2.0
+message: >-
+  If you use this software or its evaluation results, please cite it using the
+  metadata below. Results are measured on the ULB credit-card dataset and validate
+  pipeline mechanics only; they are not evidence of fraud detection on UPI/IMPS data.
+type: software
+title: "Kavach v2: a bank-agnostic, federated, threat-resilient fraud intelligence layer"
+abstract: >-
+  Research prototype of a fraud-intelligence layer for Indian retail banking: a
+  bank-adapter registry with a fixed feature contract, federated per-bank threshold
+  learning with coordinate-median (Byzantine-robust) aggregation, prompt-injection
+  hardening for LLM-based classification, and an evaluation harness. Key measured
+  findings on a five-bank partition of the ULB card-fraud dataset: federation's
+  cold-start advantage is driven by positive-class scarcity rather than sample
+  scarcity; one poisoned participant collapses FedAvg (0.682 to 0.001 AUC-PR) while
+  coordinate-median holds (0.691); per-bank calibrated thresholds deliver
+  alert-budget adherence but not additional detection.
+authors:
+  # TODO(owner): replace with your name, ORCID and affiliation before publishing.
+  - name: "Kavach v2 contributors"
+version: "2.0.0-rc1"
+date-released: "2026-09-12"
+license: MIT
+keywords:
+  - federated-learning
+  - fraud-detection
+  - byzantine-robust-aggregation
+  - coordinate-median
+  - prompt-injection
+  - llm-security
+  - upi
+  - fintech
+  - research-artifact
+references:
+  - type: article
+    title: "Calibrating Probability with Undersampling for Unbalanced Classification"
+    authors:
+      - family-names: Dal Pozzolo
+        given-names: Andrea
+      - family-names: Caelen
+        given-names: Olivier
+      - family-names: Johnson
+        given-names: Reid A.
+      - family-names: Bontempi
+        given-names: Gianluca
+    year: 2015
+    conference:
+      name: "IEEE Symposium on Computational Intelligence and Data Mining (CIDM)"
+    notes: "Source of the ULB credit-card fraud dataset used for all evaluation (OpenML id 1597)."
+  - type: article
+    title: "Communication-Efficient Learning of Deep Networks from Decentralized Data"
+    authors:
+      - family-names: McMahan
+        given-names: H. Brendan
+      - family-names: Moore
+        given-names: Eider
+      - family-names: Ramage
+        given-names: Daniel
+      - family-names: Hampson
+        given-names: Seth
+      - family-names: Agüera y Arcas
+        given-names: Blaise
+    year: 2017
+    conference:
+      name: "AISTATS"
+    notes: "FedAvg."
+  - type: article
+    title: "Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates"
+    authors:
+      - family-names: Yin
+        given-names: Dong
+      - family-names: Chen
+        given-names: Yudong
+      - family-names: Ramchandran
+        given-names: Kannan
+      - family-names: Bartlett
+        given-names: Peter
+    year: 2018
+    conference:
+      name: "ICML"
+    notes: "Coordinate-wise median and trimmed-mean aggregation."
