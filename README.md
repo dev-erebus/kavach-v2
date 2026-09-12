@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](#quick-start)
-[![Tests: 145 passing](https://img.shields.io/badge/tests-145%20passing-brightgreen.svg)](#tier-1--unit-and-contract-tests)
+[![Tests: 145 passing](https://img.shields.io/badge/tests-145%20passing-brightgreen.svg)](#how-it-is-tested--three-tiers)
 [![Status: research prototype](https://img.shields.io/badge/status-research%20prototype-orange.svg)](#status)
 
 Three findings, measured on a public card-fraud dataset partitioned into five synthetic banks:
