@@ -224,26 +224,30 @@ that survives sanitization sways a live LLM. That needs a model and a domain red
 ## Architecture and layout
 
 ```mermaid
-flowchart LR
-    subgraph bank["Bank-side (nothing raw leaves)"]
-        W[Core-banking webhook] --> R[Adapter registry<br/>auth → normalize]
-        R -->|KavachTransaction| S[§5.2 sanitizer<br/>free text → data block]
-        R -->|17-slot feature vector| M[Local model<br/>global + fine-tune]
-        S --> L[LLM classifier<br/>Node 3]
-        M --> B[Threshold bridge<br/>per-bank cutoffs<br/>fails to L2]
+flowchart TB
+    subgraph bank["Bank-side — raw transactions never leave this box"]
+        direction TB
+        W[Core-banking webhook] --> R["Adapter registry<br/>auth → normalize → KavachTransaction"]
+        V["Voice-liveness provider<br/>(interface only)"] -. "True / False / unknown" .-> R
+        R --> S["§5.2 sanitizer<br/>free text → delimited data block"]
+        R --> M["Local model<br/>global baseline + local fine-tune"]
+        S --> L["LLM classifier (Node 3)"]
+        M --> B["Threshold bridge<br/>per-bank cutoffs · fails to L2, never L0"]
         L --> D{Level}
         B --> D
-        D -->|L0| A0[allow]
-        D -->|L1| A1[warn]
-        D -->|L2| A2[hold + verify]
-        D -->|L3| A3[hard lock + review]
-        A3 --> F[FR-2 report template<br/>COMPLIANCE REVIEW REQUIRED]
-        A2 & A3 -.->|/feedback: confirmed fraud / false positive| T[Local trainer]
-        T -->|weight delta only| X
+        D -- L0 --> A0[allow]
+        D -- L1 --> A1[warn]
+        D -- L2 --> A2[hold + verify]
+        D -- L3 --> A3[hard lock + review]
+        A3 --> F["FR-2 report template<br/>COMPLIANCE REVIEW REQUIRED"]
+        A2 & A3 -. "/feedback: confirmed fraud · false positive" .-> T[Local trainer]
     end
-    X[Aggregator<br/>coordinate-median] --> G[Versioned model store<br/>spec-checked]
-    G -->|global baseline| M
-    V[Voice-liveness provider<br/>interface only] -.->|True / False / unknown| R
+    subgraph central["Central aggregator — sees weight deltas only"]
+        direction TB
+        X["Aggregator<br/>coordinate-median (Byzantine-robust)"] --> G["Versioned model store<br/>spec-checked"]
+    end
+    T -- "weight delta only" --> X
+    G -- "global baseline" --> M
 ```
 
 Rejected payloads never pass through with missing fields — they return a structured error naming the bank
