@@ -56,3 +56,7 @@ pytest -q
 python -m eval.run_eval
 python -m federated.experiments.cold_start
 ```
+
+## Authorship
+
+Claude code was used to write the code under the author's supervision and instructions
