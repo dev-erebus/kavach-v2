@@ -48,6 +48,7 @@ Reports land in `eval/output/` and `federated/output/`. Tested on Python 3.12 / 
 - [What is explicitly not verified](#what-is-explicitly-not-verified)
 - [Future work](#future-work)
 - [Out of scope](#deliberately-out-of-scope)
+- [Authorship](#authorship)
 - [Citation and license](#citation-and-license)
 
 ## Findings
@@ -293,6 +294,10 @@ Active directions, not commitments. No timelines.
 - A domain-appropriate labelled UPI/IMPS social-engineering dataset is the single thing that would turn
   the evaluation harness from a mechanics check into evidence. It is not something this repo can produce;
   if you hold such data, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Authorship
+
+Claude code was used to write the code under the author's supervision and instructions
 
 ## Citation and license
 
