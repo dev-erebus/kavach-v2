@@ -20,7 +20,9 @@ abstract: >-
 authors:
   # TODO(owner): replace with your name, ORCID and affiliation before publishing.
   - name: "Kavach v2 contributors"
-version: "2.0.0-rc1"
+repository-code: "https://github.com/dev-erebus/kavach-v2"
+url: "https://github.com/dev-erebus/kavach-v2"
+version: "2.0.0"
 date-released: "2026-09-12"
 license: MIT
 keywords:

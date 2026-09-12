@@ -23,7 +23,7 @@ Three findings, measured on a public card-fraud dataset partitioned into five sy
 ## Quick start
 
 ```bash
-git clone <this-repo> kavach-v2 && cd kavach-v2
+git clone https://github.com/dev-erebus/kavach-v2.git && cd kavach-v2
 python -m venv .venv && .venv/Scripts/activate        # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 pytest -q                                               # 145 tests, offline, ~5 s
@@ -303,6 +303,8 @@ MIT — see [LICENSE](LICENSE). If you use this work, cite it via [CITATION.cff]
 @software{kavach_v2_2026,
   title   = {Kavach v2: a bank-agnostic, federated, threat-resilient fraud intelligence layer},
   year    = {2026},
+  version = {2.0.0},
+  url     = {https://github.com/dev-erebus/kavach-v2},
   license = {MIT},
   note    = {Research prototype. Results measured on the ULB credit-card dataset; not validated on UPI/IMPS data.}
 }

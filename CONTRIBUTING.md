@@ -6,7 +6,7 @@ actually move this project. Everything else is welcome but secondary.
 ## Where to start
 
 ```bash
-git clone <this-repo> kavach-v2 && cd kavach-v2
+git clone https://github.com/dev-erebus/kavach-v2.git && cd kavach-v2
 python -m venv .venv && .venv/Scripts/activate        # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt                         # pinned; see requirements.txt header
 pytest -q                                               # 145 tests, offline, ~5 s

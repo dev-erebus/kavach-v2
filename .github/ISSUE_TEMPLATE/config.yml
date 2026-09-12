@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Adapter mapping against a real core-banking API
-    url: https://github.com/OWNER/REPO/blob/main/CONTRIBUTING.md#2-adapter-mappings-against-a-real-core-banking-api-contract
+    url: https://github.com/dev-erebus/kavach-v2/blob/master/CONTRIBUTING.md#2-adapter-mappings-against-a-real-core-banking-api-contract
     about: Read this first if you have access to a Finacle / T24 / BaNCS webhook specification.
   - name: Stealthy poisoning attacks
-    url: https://github.com/OWNER/REPO/blob/main/CONTRIBUTING.md#3-stealthy-poisoning-attacks-against-the-aggregator
+    url: https://github.com/dev-erebus/kavach-v2/blob/master/CONTRIBUTING.md#3-stealthy-poisoning-attacks-against-the-aggregator
     about: How to plug a new attack into the poisoning experiment and what to report.
